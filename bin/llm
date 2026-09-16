@@ -274,6 +274,14 @@ apply_commands() { # apply_commands <heartbeat-response-json>
         if cmd_stop >/tmp/llm-restart.$$ 2>&1 && cmd_serve >>/tmp/llm-restart.$$ 2>&1; then
           msg="restarted"; else ok=false; msg="$(cat /tmp/llm-restart.$$ 2>/dev/null)"; fi
         rm -f /tmp/llm-restart.$$ ;;
+      load|unload)
+        # from the Models page; run detached so the heartbeat keeps beating during a long load
+        local mdl; mdl="$(jq -r '.model // empty' <<<"$params")"
+        if [[ -n "$mdl" ]] && sections | grep -qxF -- "$mdl"; then
+          local verb=up; [[ "$action" == unload ]] && verb=down
+          nohup "$0" "$verb" "$mdl" >> "$RUN/ui-actions.log" 2>&1 &
+          msg="started: llm $verb $mdl"; say "gateway requested: llm $verb $mdl"
+        else ok=false; msg="not a preset section: $mdl"; fi ;;
       *) ok=false; msg="unknown action: $action" ;;
     esac
     results="$(jq -c --arg id "$id" --argjson ok "$ok" --arg msg "$msg" '. + [{id: $id, ok: $ok, msg: $msg}]' <<<"$results")"
@@ -311,7 +319,7 @@ heartbeat() {
            tmux new-session -d -s "$SESSION-heartbeat" \
              -e "LLM_SESSION=$SESSION" -e "LLM_PORT=$PORT" -e "LLM_GATEWAY_URL=$LLM_GATEWAY_URL" \
              -e "LLM_PEER_URL=${LLM_PEER_URL:-}" -e "LLM_PEER_CF_ACCESS=${LLM_PEER_CF_ACCESS:-false}" \
-             "while true; do '$0' _beat >> '$RUN/heartbeat.log' 2>&1; sleep 30; done"
+             "while true; do '$0' _beat >> '$RUN/heartbeat.log' 2>&1; sleep ${LLM_HEARTBEAT_S:-10}; done"
            say "heartbeating $(peer_url) to $LLM_GATEWAY_URL" ;;
     stop)  tmux kill-session -t ="$SESSION-heartbeat" 2>/dev/null || true
            gw_post /peers/deregister >/dev/null 2>&1 && say "deregistered from $LLM_GATEWAY_URL" || true ;;

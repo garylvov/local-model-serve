@@ -25,7 +25,8 @@ POLL, TTL, PIN_TTL = float(os.environ.get("LLM_GW_POLL", 10)), float(os.environ.
 PASSWD = CONF / "passwd"          # scrypt hash written by `llm passwd`
 COOKIE, COOKIE_TTL = "llm_session", 12 * 3600
 LOGIN_WINDOW, LOGIN_MAX = 300, 5  # failed logins per IP per window
-MUTATE_WINDOW, MUTATE_MAX = 60, 20  # model-mutating requests per IP per window (Models tab)
+MUTATE_WINDOW, MUTATE_MAX = 60, 20
+HEARTBEAT_HINT_S = 10  # bin/llm heartbeat interval; commands wait at most this long  # model-mutating requests per IP per window (Models tab)
 SESSION_HEADERS = ("x-session-id", "x-litellm-session-id", "x-claude-code-session-id", "session-id", "conversation-id")
 HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "upgrade",
        "authorization", "x-api-key", "accept-encoding", "proxy-authorization",
@@ -424,13 +425,19 @@ async def model_action(req: Request):
         others = [n for n, s in (p.get("models") or {}).items() if s == "loaded" and n != model]
         if others and not body.get("confirm"):
             return err(409, f"other model(s) currently loaded on {host}: {others}; pass confirm:true to load anyway")
-    try:
-        r = await peer_call(p, url, "POST", f"/models/{action}", json_body={"model": model})
-    except httpx.HTTPError as e:
-        return err(502, f"peer unreachable: {type(e).__name__}")
-    audit(req, f"model_{action}", host=host, model=model, status=r.status_code)
-    await poll(url)
-    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
+    # Hand the action to the machine itself (next heartbeat) instead of calling its router
+    # directly: `llm up` pre-warms large weights in parallel before loading and `llm down` evicts
+    # their page cache, which the bare router API does not (a direct UI load of a cold 127 GiB
+    # model crawled at page-fault speed for minutes). Presets only: no fuzzy names from the web.
+    if model not in (p.get("preset") or {}):
+        return err(404, f"{model} is not a preset on {host}")
+    cid = uuid.uuid4().hex[:12]
+    pending_commands.setdefault(url, []).append({"id": cid, "action": action, "params": {"model": model}})
+    p.setdefault("_queued", {})[model] = (action, time.time())
+    audit(req, f"model_{action}", host=host, model=model, queued=cid)
+    return JSONResponse({"queued": True, "id": cid, "action": action, "model": model,
+                         "note": f"{host} picks this up on its next heartbeat (every {HEARTBEAT_HINT_S} s)"},
+                        status_code=202)
 
 
 async def model_download(req: Request):
@@ -1085,6 +1092,13 @@ function specToggle(x){
 const busy=new Set();  // "host/model" currently mid-action, client-side, so every button on that
                         // row disables immediately rather than waiting for the next 4s poll
 function rowBusy(host,model){return busy.has(host+"/"+model)}
+const queued={};  // host/model -> {action, at}: shown until the machine reports a new state
+function queuedLabel(host,name,state){
+  const q=queued[host+"/"+name]; if(!q) return null;
+  const age=(Date.now()-q.at)/1000, done=q.action==="load"?(state==="loading"||state==="loaded"):(state==="unloaded");
+  if(done||age>120){delete queued[host+"/"+name]; return null}
+  return q.action==="load"?`starting (warming weights) ${Math.round(age)}s`:`stopping ${Math.round(age)}s`;
+}
 async function doLoad(host,model,otherLoaded){
   if(otherLoaded.length && !confirm(
     `Loading ${model} on ${host} may require freeing GPU(s) currently used by: ${otherLoaded.join(", ")}.\n`+
@@ -1092,14 +1106,16 @@ async function doLoad(host,model,otherLoaded){
     `this is NOT guaranteed safe. Continue?`))return;
   busy.add(host+"/"+model); render(DATA);
   try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/load`,
-    {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:otherLoaded.length>0})}); await tick()}
+    {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:otherLoaded.length>0})});
+    queued[host+"/"+model]={action:"load",at:Date.now()}; await tick()}
   catch(e){alert("load failed: "+e.message)} finally{busy.delete(host+"/"+model); render(DATA)}
 }
 async function doUnload(host,model,inflight){
   if(inflight>0 && !confirm(`${model} has ${inflight} request(s) in flight on ${host}. Unload anyway?`))return;
   busy.add(host+"/"+model); render(DATA);
   try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/unload`,
-    {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:inflight>0})}); await tick()}
+    {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:inflight>0})});
+    queued[host+"/"+model]={action:"unload",at:Date.now()}; await tick()}
   catch(e){alert("unload failed: "+e.message)} finally{busy.delete(host+"/"+model); render(DATA)}
 }
 async function doDownload(host,model,repo,quant,gib,free){
@@ -1158,8 +1174,9 @@ function render(d){
       const gpuCbs=gpuList.map(gi=>`<label><input type=checkbox class=gpu-cb value="${gi}" ${gpus.includes(gi)?"checked":""}>${gi}</label>`).join("");
       const loaded=x.state==="loaded", downloading=x.state==="downloading", loading=x.state==="loading";
       const notDownloaded=x.downloaded===false;
-      const busyRow=rowBusy(m.host,name)||downloading||loading;
-      let stateLabel=x.state||"unloaded";
+      const ql=queuedLabel(m.host,name,x.state);
+      const busyRow=rowBusy(m.host,name)||downloading||loading||!!ql;
+      let stateLabel=ql||x.state||"unloaded";
       if(notDownloaded && !downloading) stateLabel="not downloaded";
       if(x.failed) stateLabel="failed";
       let actionBtn;
