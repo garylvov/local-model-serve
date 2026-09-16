@@ -1,0 +1,142 @@
+# Model catalog: what CAN run here. Documentation + planning input for presets/*.ini
+# (the runnable configs). What IS running lives in the router's own /models endpoint.
+#
+# Sizes: summed GiB from the HF tree API (https://huggingface.co/api/models/<repo>/tree/main?recursive=true),
+# checked 2026-09-16. arch_supported: checked against vendored llama.cpp 7ceed8737 (tag b11002).
+# VRAM budget measured on this node: 22.49 GiB/GPU usable -> weights <= 18.3 (1 GPU), 110 (6), 154 (8) GiB
+# after KV and compute buffers. verified: false means "not checked against the HF API" - never invent repos.
+#
+# Vision rules (llama.cpp, verified 2026-09-16 against upstream issues):
+#  * never load a draft model (MTP/DFlash) in the same preset as an mmproj: image requests stall
+#    ~500 s and return HTTP 500 (#27408). Keep text-with-drafting and vision presets separate.
+#  * pass --image-min-tokens 1024 for Qwen-VL mmproj files (they carry no image_min_pixels, so
+#    llama.cpp caps at 4096 image tokens / ~4.2 Mpx while Qwen's own preprocessor allows ~16.8 Mpx).
+#  * KV slot save/restore does not work for vision models (#19466).
+#  * unverified here: image-edge loss reports #27886 (Flash-Next) and #27419 (27B on HIP) - when a
+#    vision preset is loaded, send an image with content at the top and bottom edges and check both.
+#
+# Serving notes that apply to all entries: llama-server flags live in presets/*.ini; tool calling needs
+# --jinja; reasoning_content from earlier turns is passed through by the router and the gateway unchanged.
+
+models:
+  qwen3.8-27b:
+    match: [qwen, qwen3.8, qwen27b, fast, dense]
+    repo: unsloth/Qwen3.8-27B-GGUF
+    arch: qwen35            # llama.cpp PR #19435/#19468 (Feb 2026)
+    arch_supported: true
+    params: 27.8B dense
+    tags: [tools, reasoning, vision, fim]
+    tool_parser: Qwen3-Coder XML (specialized in common/chat.cpp)
+    mmproj: mmproj-F16.gguf (0.86 GiB)
+    draft: {mtp: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf (1.3 GiB, spec-type draft-mtp)"}
+    quants:                  # file, size GiB, where it fits (weights only; KV is small: 48/64 layers linear attn)
+      - {name: UD-Q4_K_XL, file: Qwen3.8-27B-UD-Q4_K_XL.gguf, gib: 16.35, fits: 1 GPU (+mmproj = 17.3)}
+      - {name: UD-Q5_K_XL, file: Qwen3.8-27B-UD-Q5_K_XL.gguf, gib: 19.44, fits: 2 GPUs}
+      - {name: Q8_0, file: Qwen3.8-27B-Q8_0.gguf, gib: 27.05, fits: 2 GPUs}
+      - {name: UD-Q8_K_XL, file: Qwen3.8-27B-UD-Q8_K_XL.gguf, gib: 29.30, fits: 2 GPUs}
+      - {name: BF16, file: BF16/Qwen3.8-27B-BF16-0000{1,2}-of-00002.gguf, gib: 50.90, fits: 3 GPUs}
+    issues: ["#27139 Codex fails with the Qwen3.8 chat template (verify tool round-trip)",
+             "#27829 DFlash2 drafter + `-sm tensor` aborts"]
+    verified: true
+
+  qwen3.8-flash-next:
+    match: [flashnext, flash, next, big, main]
+    repo: unsloth/Qwen3.8-Flash-Next-GGUF
+    arch: qwen4exp           # llama.cpp PR #27742 (merged 2026-08-27)
+    arch_supported: true
+    params: 180B total / ~6B active MoE (125B + 51B n-gram embedding + 4B MTP)
+    tags: [tools, reasoning, vision]
+    tool_parser: Qwen3-Coder XML
+    mmproj: mmproj-F16.gguf (0.84 GiB)
+    draft: {mtp: "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf (3.85 GiB) - MTP NOT in master yet (PR #28243)"}
+    quants:
+      - {name: UD-Q2_K_XL, gib: 73.45, fits: 4 GPUs}
+      - {name: UD-Q4_K_XL, gib: 103.69, fits: 6 GPUs}
+      - {name: UD-Q5_K_XL, gib: 147.42, fits: 8 GPUs}
+    issues: ["#27886 hallucination/vision quality reports", "`-sm tensor` disabled for this arch",
+             "#28497 non-deterministic QSA top-k on CUDA"]
+    verified: true
+
+  laguna-s-2.1:
+    match: [laguna, poolside]
+    repo: poolside/Laguna-S-2.1-GGUF
+    arch: laguna             # llama.cpp PR #25165 (merged 2026-07-22)
+    arch_supported: true
+    params: 117.6B total / ~8B active; 48 layers, 12 global attn + 36 SWA(512) -> small KV
+    tags: [tools, reasoning]
+    quants:
+      - {name: Q4_K_M, file: laguna-s-2.1-Q4_K_M.gguf, gib: 89.44, fits: 5-6 GPUs}
+      - {name: Q8_0, file: laguna-s-2.1-Q8_0.gguf, gib: 119.91, fits: 6-7 GPUs}
+    draft: {dflash: "laguna-s-2.1-DFlash-BF16.gguf (2.08 GiB); upstream loader rejects it (issue #26669,
+      'expected 76, got 69'); full support is in the poolsideai/llama.cpp `laguna` branch"}
+    issues: ["#27899 CUDA NaN logits for some Laguna-S k-quant mixes", "DFlash unusable on master"]
+    priority: low            # dropped 2026-09-16 pending operator decision
+    verified: true
+
+  minimax-m2.7:
+    match: [minimax, m2, m27]
+    repo: unsloth/MiniMax-M2.7-GGUF
+    arch: minimax-m2
+    arch_supported: true
+    params: 229B total / ~10B active; 62 layers, 8 KV heads -> KV q8_0 ~129 KiB/token (34.5 GiB at 4x64k)
+    tags: [tools, reasoning]
+    tool_parser: autoparser from the template (no specialized M2 parser; PR #22106 closed)
+    quants:
+      - {name: UD-Q2_K_XL, gib: 70.11, fits: 4 GPUs (short ctx)}
+      - {name: UD-Q3_K_XL, gib: 94.94, fits: 6 GPUs}
+      - {name: UD-IQ4_XS, gib: 100.97, fits: 6 GPUs}
+      - {name: UD-Q4_K_XL, gib: 131.11, fits: 8 GPUs, or 4 GPUs with --n-cpu-moe 40 and >=128 GiB RAM}
+      - {name: UD-Q5_K_S, gib: 148.12, fits: 8 GPUs}
+    verified: true
+
+  qwen3.6-35b-a3b:
+    match: [qwen3.6, 35b, a3b]
+    repo: unsloth/Qwen3.6-35B-A3B-GGUF
+    arch: qwen35moe
+    arch_supported: true
+    params: 36B total / 3B active
+    tags: [tools, reasoning, vision]
+    vision_safe: false   # #27931: llama-server crashes when text and image turns alternate - the agent pattern
+    quants: [{name: UD-IQ4_NL, gib: 16.8, fits: 1 GPU (+0.84 mmproj)}]
+    verified: false      # sizes from the research report, not re-checked against the HF API here
+
+  qwen3-coder-30b:
+    match: [coder, qwen3coder, 30b, a3b]
+    repo: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+    arch: qwen3moe
+    arch_supported: true
+    params: 30B total / 3B active
+    tags: [tools, fim]
+    quants:
+      - {name: UD-Q4_K_XL, gib: 16.45, fits: 1 GPU}
+      - {name: Q8_0, file: Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf, gib: 30.25, fits: 2 GPUs}
+    note: superseded for this rig by qwen3.8-27b (better scores, vision); kept as a fallback
+    verified: true
+
+  minimax-m3:
+    match: [m3]
+    repo: unsloth/MiniMax-M3-GGUF
+    arch: minimax-m3
+    arch_supported: true
+    params: ~427B total / ~23B active
+    tags: [tools, reasoning, vision]
+    mmproj: not in the unsloth repo - use AesSedai/MiniMax-M3-GGUF or bartowski (F16 1.61 GiB)
+    quants: [{name: UD-IQ3_XXS, gib: 148.46, fits: 8 GPUs}, {name: UD-Q4_K_XL, gib: 246.74, fits: CPU offload only}]
+    verified: true
+
+  glm-5.3-flash:
+    match: [glm, glm5, glmflash]
+    repo: unsloth/GLM-5.3-Flash-GGUF
+    arch: glm5next
+    arch_supported: false    # needs one of the open PRs #27752 / #27754 / #27773
+    params: 321B total / 18B active
+    tags: [tools, reasoning, vision]
+    quants: [{name: UD-Q2_K_XL, gib: 101.25, fits: 6 GPUs}, {name: UD-IQ4_XS, gib: 146.05, fits: 8 GPUs}]
+    note: best independent scores that would fit (AA TB2.1 84.3) - revisit when a PR merges
+    verified: true
+
+  # Known-not-runnable here, listed so nobody re-researches them:
+  deepseek-v4.1-flash: {repo: null, arch: deepseek41, arch_supported: false,
+    note: "no llama.cpp support (draft PR #28696) and no mainstream GGUF", verified: true}
+  kimi-k2.7-code: {repo: unsloth/Kimi-K2.7-Code-GGUF, arch: deepseek2, arch_supported: true,
+    note: "1T params; smallest quant 283 GiB - CPU offload only", verified: true}

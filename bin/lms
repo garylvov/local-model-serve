@@ -1,9 +1,1 @@
-#!/usr/bin/env bash
-# Thin shim: run the lms CLI with the repo venv if present, else system python3 (needs PyYAML).
-set -euo pipefail
-here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-py="${LMS_PYTHON:-}"
-if [[ -z "$py" ]]; then
-  if [[ -x "$here/.venv/bin/python" ]]; then py="$here/.venv/bin/python"; else py="$(command -v python3)"; fi
-fi
-exec "$py" "$here/lib/lms.py" "$@"
+llm

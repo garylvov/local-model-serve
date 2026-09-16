@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# llm: thin wrapper around llama-server router mode (one router per machine).
+# See README.md. Every model/GPU choice lives in presets/*.ini (llama.cpp's own preset format).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+CONF="${LLM_CONFIG_DIR:-$HOME/.config/local-model-serve}"
+KEYFILE="$CONF/api-key"          # read by llama-server --api-key-file
+AUTH="$CONF/auth.env"            # LLM_BASE_URL + LLM_API_KEY for clients
+BIN="${LLM_LLAMA_BIN:-$ROOT/vendor/llama.cpp/build/bin}"
+export LLAMA_CACHE="${LLM_MODELS_DIR:-$ROOT/models}"
+PORT="${LLM_PORT:-8080}"
+HOST="$(hostname -s)"
+SESSION="${LLM_SESSION:-llm}"
+RUN="$ROOT/run/$HOST/$SESSION"
+URL="http://127.0.0.1:$PORT"
+
+# Optional LLM_GATEWAY_URL / LLM_PEER_URL / LLM_PEER_CF_ACCESS may also live in auth.env.
+[[ -r "$AUTH" ]] && eval "$(grep -E '^(LLM_GATEWAY_URL|LLM_PEER_URL|LLM_PEER_CF_ACCESS)=' "$AUTH" | sed 's/^/: "${/; s/=/:=/; s/$/}";/')"
+GW_PORT="${LLM_GATEWAY_PORT:-4000}"
+
+die() { echo "llm: $*" >&2; exit 1; }
+say() { echo "llm: $*"; }
+mkdir -p "$RUN"
+
+# Warn if Simon Willison's `llm` (or anything else) shadows this one on PATH.
+other="$(type -P llm 2>/dev/null || true)"
+if [[ -n "$other" && "$(readlink -f "$other")" != "$(readlink -f "${BASH_SOURCE[0]}")" && -z "${LLM_NO_SHADOW_WARN:-}" ]]; then
+  echo "llm: note: another 'llm' is on PATH ($other); use $ROOT/bin/llm or the 'lms' symlink" >&2
+fi
+
+# ---- presets -------------------------------------------------------------------------
+gpu_count() { nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true; }
+
+preset() { # the preset file for this machine: $LLM_PRESET, else remembered choice, else by GPU count
+  local name="${LLM_PRESET:-}"
+  [[ -z "$name" && -f "$RUN/preset" ]] && name="$(cat "$RUN/preset")"
+  if [[ -z "$name" ]]; then
+    case "$(gpu_count)" in
+      8) name=oscar-8x ;; 4) name=quad-24g ;; 2) name=dual-24g ;; 1) name=single-24g ;;
+      *) die "no preset for $(gpu_count) GPU(s); set LLM_PRESET=<name> (see presets/)" ;;
+    esac
+  fi
+  [[ -f "$ROOT/presets/$name.ini" ]] || die "missing presets/$name.ini"
+  echo "$ROOT/presets/$name.ini"
+}
+
+sections() { awk -F'[][]' '/^\[/ && $2 != "*" {print $2}' "$(preset)"; }
+
+ini_get() { # ini_get <section> <key>
+  awk -v s="[$1]" -v k="$2" '
+    /^\[/ {in_s = ($0 == s)} in_s && $0 ~ "^"k"[ \t]*=" {sub(/^[^=]*=[ \t]*/, ""); print; exit}' "$(preset)"
+}
+
+resolve() { # exact section, else substring match on name or its "; match:" words (ignoring - _ . and case)
+  local q n hits=()
+  q="$(tr -d '._ -' <<<"${1,,}")"
+  for n in $(sections); do [[ "$n" == "$1" ]] && { echo "$n"; return; }; done
+  for n in $(sections); do
+    local words; words="$(awk -v s="[$n]" '/^\[/ {in_s = ($0 == s)} in_s && /^; match:/ {sub(/^; match:/, ""); print}' "$(preset)")"
+    for w in "$n" $words; do
+      if [[ "$(tr -d '._ -' <<<"${w,,}")" == *"$q"* ]]; then hits+=("$n"); break; fi
+    done
+  done
+  case "${#hits[@]}" in
+    1) echo "${hits[0]}" ;;
+    0) die "no model matches '$1' in $(basename "$(preset)"); have: $(sections | tr '\n' ' ')" ;;
+    *) die "'$1' is ambiguous: ${hits[*]}" ;;
+  esac
+}
+
+# ---- router API (key goes to curl via a private config on stdin, never argv) -----------
+api() { # api GET|POST <path> [json]
+  [[ -r "$KEYFILE" ]] || die "no API key; run: llm auth init"
+  local args=(-sS --max-time "${LLM_API_TIMEOUT:-30}" -X "$1" "$URL$2")
+  [[ -n "${3:-}" ]] && args+=(-H 'Content-Type: application/json' --data "$3")
+  printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -K - "${args[@]}"
+}
+
+running() { tmux has-session -t "=$SESSION" 2>/dev/null; }
+healthy() { curl -sf --max-time 3 "$URL/health" >/dev/null 2>&1; }
+status_of() { api GET /models | jq -r --arg m "$1" '.data[] | select(.id == $m) | .status.value // "unknown"'; }
+loaded() { api GET /models | jq -r '.data[] | select(.status.value == "loaded" or .status.value == "loading") | .id'; }
+
+wait_status() { # wait_status <model> <want> <timeout-s>
+  local t0=$SECONDS s
+  while (( SECONDS - t0 < $3 )); do
+    s="$(status_of "$1")"
+    [[ "$s" == "$2" ]] && { say "$1: $2 after $((SECONDS - t0))s"; return 0; }
+    if [[ "$2" == loaded && "$s" == unloaded ]] && api GET /models | jq -e --arg m "$1" '.data[] | select(.id == $m) | .status.failed' >/dev/null; then
+      die "$1 failed to load; see $RUN/router.log"
+    fi
+    sleep 2
+  done
+  die "$1: not $2 after $3s (now: $s)"
+}
+
+# ---- commands ------------------------------------------------------------------------
+cmd_auth() {
+  case "${1:-}" in
+    init)
+      install -d -m 700 "$CONF"
+      if [[ ! -s "$KEYFILE" ]]; then (umask 077; openssl rand -hex 32 > "$KEYFILE"); say "generated $KEYFILE"; fi
+      local base="${2:-${LLM_BASE_URL:-http://$HOST:$PORT}}"
+      local extra; extra="$(grep -vE '^(#|LLM_BASE_URL=|LLM_API_KEY=)' "$AUTH" 2>/dev/null || true)"
+      (umask 077; { printf '# local-model-serve client auth (mode 0600)\nLLM_BASE_URL=%s\nLLM_API_KEY=%s\n' \
+        "$base" "$(<"$KEYFILE")"; [[ -z "$extra" ]] || printf '%s\n' "$extra"; } > "$AUTH")
+      say "wrote $AUTH (LLM_BASE_URL=$base)" ;;
+    print-client)  # pipe to another machine; refuses to print a key onto a terminal
+      [[ -t 1 ]] && die "refusing to print the key to a terminal; pipe it: llm auth print-client [URL] | ssh host 'umask 077; mkdir -p ~/.config/local-model-serve; cat > ~/.config/local-model-serve/auth.env'"
+      printf 'LLM_BASE_URL=%s\nLLM_API_KEY=%s\n' "${2:-https://llm.garylvov.com}" "$(<"$KEYFILE")" ;;
+    *) die "usage: llm auth init [BASE_URL] | print-client [BASE_URL]" ;;
+  esac
+}
+
+cmd_serve() {
+  running && { say "router already running in tmux '$SESSION' ($URL)"; heartbeat start; return 0; }
+  [[ -x "$BIN/llama-server" ]] || die "llama.cpp not built; run scripts/build-llama.sh"
+  [[ -s "$KEYFILE" ]] || cmd_auth init
+  local p; p="$(preset)"; basename "$p" .ini > "$RUN/preset"
+  say "preset $(basename "$p") ($(gpu_count) GPUs), models: $(sections | tr '\n' ' ')"
+  tmux new-session -d -s "$SESSION" -c "$ROOT" -e "LLAMA_CACHE=$LLAMA_CACHE" \
+    "exec '$BIN/llama-server' --models-preset '$p' --no-models-autoload --models-max 0 \
+       --host 0.0.0.0 --port $PORT --api-key-file '$KEYFILE' >> '$RUN/router.log' 2>&1"
+  local t0=$SECONDS
+  until healthy; do
+    running || die "router exited; see $RUN/router.log"
+    (( SECONDS - t0 > 60 )) && die "router not healthy after 60s; see $RUN/router.log"
+    sleep 1
+  done
+  say "router up on 0.0.0.0:$PORT (tmux '$SESSION', log $RUN/router.log)"
+  heartbeat start
+}
+
+# ---- gateway membership: heartbeat this router's URL to the gateway every 30 s ----------
+gpu_json() { # live per-GPU numbers for the gateway status page (no prompts, no paths)
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+    --format=csv,noheader,nounits 2>/dev/null | jq -Rs 'split("\n") | map(select(length > 0) | split(", ") |
+      {index: (.[0]|tonumber), name: .[1], util: (.[2]|tonumber), mem_used: (.[3]|tonumber),
+       mem_total: (.[4]|tonumber), temp: (.[5]|tonumber), power: (.[6]|tonumber? // null)})' || echo "[]"
+}
+
+gw_post() { # gw_post /peers/register|/peers/deregister
+  local body; body="$(jq -nc --arg u "${LLM_PEER_URL:-http://$HOST:$PORT}" --arg h "$HOST" \
+    --argjson cf "${LLM_PEER_CF_ACCESS:-false}" --argjson g "$(gpu_json)" \
+    '{url: $u, host: $h, cf_access: $cf, gpus: $g}')"
+  printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS --max-time 10 -K - -X POST \
+    -H 'Content-Type: application/json' "${LLM_GATEWAY_URL%/}$1" --data "$body"
+}
+
+heartbeat() {
+  [[ -n "${LLM_GATEWAY_URL:-}" ]] || { [[ "$1" == start ]] && say "no LLM_GATEWAY_URL: not joining a gateway"; return 0; }
+  case "$1" in
+    start) tmux has-session -t ="$SESSION-heartbeat" 2>/dev/null && return 0
+           # tmux does not inherit this shell's env, so pass the peer identity explicitly
+           tmux new-session -d -s "$SESSION-heartbeat" \
+             -e "LLM_SESSION=$SESSION" -e "LLM_PORT=$PORT" -e "LLM_GATEWAY_URL=$LLM_GATEWAY_URL" \
+             -e "LLM_PEER_URL=${LLM_PEER_URL:-http://$HOST:$PORT}" -e "LLM_PEER_CF_ACCESS=${LLM_PEER_CF_ACCESS:-false}" \
+             "while true; do '$0' _beat >> '$RUN/heartbeat.log' 2>&1; sleep 30; done"
+           say "heartbeating ${LLM_PEER_URL:-http://$HOST:$PORT} to $LLM_GATEWAY_URL" ;;
+    stop)  tmux kill-session -t ="$SESSION-heartbeat" 2>/dev/null || true
+           gw_post /peers/deregister >/dev/null 2>&1 && say "deregistered from $LLM_GATEWAY_URL" || true ;;
+  esac
+}
+
+cmd_gateway() {
+  case "${1:-status}" in
+    up) tmux has-session -t =llm-gateway 2>/dev/null && { say "gateway already running"; return 0; }
+        [[ -s "$KEYFILE" ]] || cmd_auth init
+        [[ -s "$CONF/passwd" ]] || die "no browser password set: run 'llm passwd' first (the gateway serves chat + /status)"
+        if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
+          uv venv -q -p 3.12 "$ROOT/.venv" && uv pip install -q -p "$ROOT/.venv/bin/python" httpx starlette uvicorn
+        fi
+        tmux new-session -d -s llm-gateway -c "$ROOT/gateway" "exec '$ROOT/.venv/bin/python' -m uvicorn llm_gateway:app \
+          --host 0.0.0.0 --port $GW_PORT --no-access-log --timeout-keep-alive 75 >> '$RUN/gateway.log' 2>&1"
+        sleep 3; curl -sf "http://127.0.0.1:$GW_PORT/health" && echo && say "gateway up on 0.0.0.0:$GW_PORT" ;;
+    down) tmux kill-session -t =llm-gateway 2>/dev/null; say "gateway down" ;;
+    status) printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS -K - "http://127.0.0.1:$GW_PORT/peers" | jq . ;;
+    *) die "usage: llm gateway up|down|status" ;;
+  esac
+}
+
+cmd_stop() { heartbeat stop; running && tmux send-keys -t "=$SESSION" C-c && sleep 5; running && tmux kill-session -t "=$SESSION"; say "router stopped"; }
+
+cmd_up() {
+  [[ $# -ge 1 ]] || die "usage: llm up <model>..."
+  running || cmd_serve
+  local m
+  for arg in "$@"; do
+    m="$(resolve "$arg")"
+    say "loading $m ($(ini_get "$m" hf-repo) on $(ini_get "$m" device))"
+    api POST /models/load "{\"model\":\"$m\"}" | jq -c .
+    wait_status "$m" loaded "${LLM_LOAD_TIMEOUT:-1800}"
+  done
+}
+
+cmd_down() {
+  [[ $# -ge 1 ]] || die "usage: llm down <model>..."
+  local m
+  for arg in "$@"; do
+    m="$(resolve "$arg")"
+    api POST /models/unload "{\"model\":\"$m\"}" | jq -c .
+    wait_status "$m" unloaded 120
+  done
+}
+
+cmd_pause() { # unload everything, remember what was loaded
+  local ms; ms="$(loaded)"
+  [[ -n "$ms" ]] || { say "nothing loaded"; return 0; }
+  echo "$ms" > "$RUN/paused"
+  local t0=$SECONDS
+  heartbeat stop
+  # shellcheck disable=SC2086
+  cmd_down $ms
+  say "paused ($(tr '\n' ' ' < "$RUN/paused")) in $((SECONDS - t0))s; list saved to $RUN/paused"
+}
+
+cmd_resume() {
+  [[ -s "$RUN/paused" ]] || die "nothing to resume ($RUN/paused missing)"
+  local t0=$SECONDS
+  # shellcheck disable=SC2046
+  cmd_up $(cat "$RUN/paused")
+  rm -f "$RUN/paused"
+  heartbeat start
+  say "resumed in $((SECONDS - t0))s"
+}
+
+cmd_ls() {
+  healthy || die "router not running on $URL (llm serve)"
+  printf '%-22s %-10s %-42s %-24s %s\n' MODEL STATUS SOURCE DEVICES "DECODE tok/s (avg)"
+  api GET /models | jq -r '.data[] | [.id, .status.value] | @tsv' | while IFS=$'\t' read -r id st; do
+    local tps="-"
+    if [[ "$st" == loaded ]]; then
+      tps="$(api GET "/metrics?model=$id" 2>/dev/null | awk '/^llamacpp:predicted_tokens_seconds /{printf "%.1f", $2}')"
+    fi
+    printf '%-22s %-10s %-42s %-24s %s\n' "$id" "$st" "$(ini_get "$id" hf-repo)" "$(ini_get "$id" device)" "${tps:--}"
+  done
+}
+
+cmd_pull() {
+  [[ $# -ge 1 ]] || die "usage: llm pull <model>..."
+  local m args
+  for arg in "$@"; do
+    m="$(resolve "$arg")"; args=(-hf "$(ini_get "$m" hf-repo)")
+    [[ -n "$(ini_get "$m" hf-file)" ]] && args+=(--hf-file "$(ini_get "$m" hf-file)")
+    [[ "$(ini_get "$m" spec-type)" == draft-dflash ]] && args+=(--dflash)
+    say "pulling $m into $LLAMA_CACHE: llama download ${args[*]}"
+    "$BIN/llama" download "${args[@]}"
+  done
+}
+
+cmd_tunnel() { # this machine's OWN cloudflared connector; token in $CONF/tunnel-token (0600)
+  local tok="$CONF/tunnel-token" cf; cf="$(type -P cloudflared || echo "$HOME/.local/bin/cloudflared")"
+  case "${1:-status}" in
+    up)
+      tmux has-session -t =llm-tunnel 2>/dev/null && die "llm-tunnel already running"
+      [[ -r "$tok" && "$(stat -c %a "$tok")" == 600 ]] || die "$tok missing or not mode 0600 (see scripts/cf-machine.sh)"
+      if [[ -r "$HOME/.config/slurm-dash/tunnel-token" ]] && cmp -s "$tok" "$HOME/.config/slurm-dash/tunnel-token"; then
+        die "refusing: that is the Oscar dashboard tunnel token; every machine needs its own tunnel"
+      fi
+      local proto="${LLM_TUNNEL_PROTOCOL:-quic}"
+      tmux new-session -d -s llm-tunnel -e "TUNNEL_TOKEN_FILE=$tok" \
+        "exec '$cf' tunnel --no-autoupdate --protocol $proto run >> '$RUN/tunnel.log' 2>&1"
+      sleep 15
+      if [[ "$proto" == quic ]] && ! tail -n 50 "$RUN/tunnel.log" | grep -q 'Registered tunnel connection'; then
+        say "quic did not register within 15s (UDP blocked?); retrying with http2"
+        tmux kill-session -t =llm-tunnel; LLM_TUNNEL_PROTOCOL=http2 cmd_tunnel up; return
+      fi
+      echo "$proto" > "$RUN/tunnel.protocol"; say "tunnel up ($proto)" ;;
+    down) tmux kill-session -t =llm-tunnel 2>/dev/null; say "tunnel down" ;;
+    status) tmux has-session -t =llm-tunnel 2>/dev/null && say "tunnel up ($(cat "$RUN/tunnel.protocol" 2>/dev/null))" || say "tunnel down" ;;
+    *) die "usage: llm tunnel up|down|status" ;;
+  esac
+}
+
+cmd_join() { # one command per machine
+  if [[ "${1:-}" == --client ]]; then
+    local base key
+    read -rp "LLM base URL (e.g. https://llm.garylvov.com): " base
+    read -rsp "API key: " key; echo
+    install -d -m 700 "$CONF"
+    (umask 077; printf 'LLM_BASE_URL=%s\nLLM_API_KEY=%s\n' "$base" "$key" > "$AUTH")
+    say "wrote $AUTH"; return
+  fi
+  [[ -x "$BIN/llama-server" ]] || "$ROOT/scripts/build-llama.sh"
+  if [[ ! -s "$KEYFILE" && -r "$AUTH" ]]; then  # reuse the shared key from a copied auth.env
+    (umask 077; sed -n 's/^LLM_API_KEY=//p' "$AUTH" > "$KEYFILE")
+  fi
+  cmd_auth init "$(sed -n 's/^LLM_BASE_URL=//p' "$AUTH" 2>/dev/null || true)"
+  cmd_serve
+  if [[ -r "$CONF/tunnel-token" ]]; then cmd_tunnel up; else
+    say "no $CONF/tunnel-token yet: create this machine's tunnel with scripts/cf-machine.sh $HOST (dry-run first)"
+  fi
+  say "models in $(basename "$(preset)"): $(sections | tr '\n' ' ') -- load with: llm up <model>"
+}
+
+cmd_builds() { # list build variants and whether they are built
+  printf '%-18s %-46s %s\n' VARIANT DIR STATE
+  awk '/^  [a-z0-9-]+:/ {v=$1; sub(":","",v)} /^    dir:/ {print v, $2}' "$ROOT/catalog/builds.yaml" |
+  while read -r v d; do
+    [[ -x "$ROOT/$d/build/bin/llama-server" ]] && st="built $(cat "$ROOT/$d.commit" 2>/dev/null | cut -c1-9)" || st="not built"
+    printf '%-18s %-46s %s\n' "$v" "$d" "$st"
+  done
+}
+
+cmd_build() { # build a variant from catalog/builds.yaml in tmux session llm-build-<variant>
+  local v="${1:?usage: llm build <variant>}"
+  tmux has-session -t "=llm-build-$v" 2>/dev/null && die "llm-build-$v already running"
+  tmux new-session -d -s "llm-build-$v" -c "$ROOT" \
+    "scripts/build-llama.sh '$v' 2>&1 | tee -a '$RUN/build-$v.log'"
+  say "building variant '$v' in tmux llm-build-$v (log $RUN/build-$v.log)"
+}
+
+cmd_passwd() { # store a scrypt hash for the browser login (never the password itself)
+  install -d -m 700 "$CONF"
+  [[ -x "$ROOT/.venv/bin/python" ]] || die "gateway venv missing; run: llm gateway up"
+  "$ROOT/.venv/bin/python" "$ROOT/gateway/set_password.py" "$CONF/passwd"
+}
+
+usage() { sed -n '2,3p' "$0"; echo "usage: llm serve|stop|up|down|pause|resume|ls|pull|gateway|passwd|build|builds|tunnel|join|auth ..."; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  serve|stop|up|down|pause|resume|ls|pull|tunnel|join|auth|gateway|passwd|build|builds) "cmd_$cmd" "$@" ;;
+  _beat) gw_post /peers/register; echo ;;
+  preset) preset ;;
+  *) usage; [[ -z "$cmd" || "$cmd" == -h || "$cmd" == --help ]] || exit 2 ;;
+esac

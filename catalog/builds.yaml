@@ -1,0 +1,27 @@
+# llama.cpp build variants. `scripts/build-llama.sh <variant>` builds into vendor/llama.cpp-<variant>/
+# (the default variant `master` keeps the historical path vendor/llama.cpp/).
+# A catalog model or preset may point at a variant; `llm build <variant>` / `llm builds` drive this.
+builds:
+  master:
+    remote: https://github.com/ggml-org/llama.cpp
+    ref: 7ceed8737fdb4eb09b4760e77bd12d38012de5a8   # pinned: the commit this repo was verified against (tag b11002)
+    dir: vendor/llama.cpp
+    cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
+    status: built+verified on gpu2260 2026-09-16 (see _out.md)
+
+  poolside-laguna:
+    remote: https://github.com/poolsideai/llama.cpp
+    ref: laguna          # fork branch; the Laguna card says full DFlash support lives here
+    dir: vendor/llama.cpp-poolside-laguna
+    cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
+    for: [laguna-s-2.1, laguna-xs-2.1]
+    status: NOT built (operator deciding; upstream rejects the Laguna DFlash sidecar, issue #26669)
+
+  glm53:
+    remote: https://github.com/ggml-org/llama.cpp
+    ref: refs/pull/27754/head   # GLM-5.3-Flash (glm5next) text+vision PR; #27752 is text-only, #27773 is an alternative
+    dir: vendor/llama.cpp-glm53
+    cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
+    for: [glm-5.3-flash]
+    status: NOT built (experiment gated on the Qwen3.8 bring-up; weights are 146 GiB)
+    notes: needs NVIDIA_TF32_OVERRIDE=0 and -fa off per the PR; watch issue #26027 (GLM_DSA CUDA corruption)
