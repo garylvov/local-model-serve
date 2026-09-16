@@ -261,20 +261,61 @@ Logs: `run/gpu2260/llm/router.log`, `run/gpu2260/llm/gateway.log`, `models/logs/
 Nothing else on the node was touched: no `scancel`, no other user's jobs, no slurm-dash sessions,
 no `cloudflared`.
 
+## Operator decisions applied (2026-09-16, after the first hand-off)
+
+1. **Gateway moved to login009.** It now runs there in tmux `llm-gateway` (`0.0.0.0:4000`, one
+   `uvicorn` process at `nice -n 5`, 10 s peer polling, no GPU dependency), started from the same
+   shared-storage checkout. gpu2260's router registers to it (`llm-heartbeat` -> `http://login009:4000`)
+   and a chat completion through `http://login009:4000` returned 200. The compute-node gateway on
+   `gpu2260:4000` was stopped. `LLM_GATEWAY_HOST` (default `login009`) / `LLM_GATEWAY_URL` make the
+   host configurable; `LLM_GATEWAY_URL=none` opts a machine out. It survives this job ending and any
+   logout, but not a login-node reboot - README documents re-running `llm gateway up` and notes that
+   a user `@reboot` crontab entry is possible (crontab exists on login009, glvov has none) subject to
+   CCV policy; no systemd unit was added.
+2. **Laguna abandoned.** `lms-dl-laguna` stopped and `models/models--poolside--Laguna-S-2.1-GGUF`
+   (59 GiB of partials) deleted. `catalog/models.yaml` now marks it `downloaded: false` with the
+   reason (DFlash rejected upstream #26669, CUDA NaN logits #27899, vendor-only benchmarks), and the
+   `oscar-8x` preset section is labelled NOT DOWNLOADED.
+3. **Cloudflare dry-run against the login-node origin** (`http://localhost:4000`, matching the style
+   `dag.garylvov.com` already uses, because the connectors run on login009): diff below, still no writes.
+
+```
+--- before
++++ after
+@@ -13,6 +13,11 @@
+       "hostname": "dag.garylvov.com"
+     },
+     {
++      "hostname": "llm.garylvov.com",
++      "service": "http://localhost:4000",
++      "originRequest": {}
++    },
++    {
+       "service": "http_status:404"
+     }
+   ],
+```
+
+**Tunnel connector census (read-only):** the 8 connections are **two connectors, both owned by
+glvov and both running on login009** - pids with 36d and 20d uptime, matching the API's
+`run_at` 2026-08-10T22:23Z (tmux `cloudflared-setup`) and 2026-08-26T19:42Z (tmux `slurm-dash`),
+4 QUIC connections each (colos ewr01/05/08/12 and ewr01/11/12/15), cloudflared 2026.7.3. A third
+cloudflared on login009 belongs to another user (yma158) on a different tunnel. Both glvov
+connectors serving one token is why `http://localhost:4000` is safe here - but if a connector is
+ever started on another host, `localhost` would resolve on that host instead, so either keep both
+connectors on login009 or change the origin to `http://login009:4000`.
+
 ## Needs an operator decision
 
-1. **Approve and apply the Cloudflare route** (`scripts/cf-route.sh --service http://gpu2260:4000 --apply`)
-   — until then nothing is reachable at `https://llm.garylvov.com` and the Cloudflare streaming
-   test cannot be run. Note the gateway port 4000 is only reachable while this Slurm job lives on
-   gpu2260; a route to a specific compute node will break when the job ends. Consider running the
-   gateway on a login node instead (it is pure Python and needs no GPU) and pointing the tunnel there.
+1. **Approve and apply the Cloudflare route**:
+   `scripts/cf-route.sh --service http://localhost:4000 --apply` (origin now on login009, so it no
+   longer dies with the Slurm job). Until it is applied nothing answers at `https://llm.garylvov.com`
+   and the Cloudflare streaming test cannot be run.
 2. **Set the browser password**: `llm passwd` (mine is random and unknown). Optionally put
    Cloudflare Access in front of `llm.garylvov.com` instead — stronger, and documented, not applied.
 3. **Big model**: confirm Qwen3.8-Flash-Next UD-Q4_K_XL as the GPUs 0–5 model once downloaded, or
    pick MiniMax-M2.7 / Laguna / GLM-5.3-Flash (needs the `glm53` PR build) instead.
-4. **Laguna**: DFlash is unusable on upstream master (issue #26669) and issue #27899 reports CUDA
-   NaN logits for some Laguna-S quants. Say whether to build the `poolside-laguna` fork
-   (`llm build poolside-laguna`) or abandon Laguna and delete the 27 GiB partial.
+4. ~~Laguna~~ — decided: abandoned and deleted (see above).
 5. **GLM-5.3-Flash experiment** (deliverable 18) not started: it needs a PR build plus 146 GiB.
 6. Two small known warts: `dedup-cache-models = true` does not hide the raw cache entries for
    unsloth repos (their cache tag is `Q4_K_XL` while the preset asks for `UD-Q4_K_XL`), so
