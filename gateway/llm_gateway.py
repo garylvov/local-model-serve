@@ -421,21 +421,24 @@ HARDWARE_HTML = """<!doctype html><html lang=en><meta charset=utf-8>
 @media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#161b22;--fg:#e6edf3;--mute:#8b949e;--line:#262c36;
 --track:#232a33;--ok:#3fb950;--warn:#d29922;--hot:#f85149;--acc:#58a6ff}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;
-padding:52px 14px 24px}main{max-width:1100px;margin:0 auto}
-header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.4rem 1rem;margin-bottom:12px}
-h1{font-size:18px;margin:0}.mute{color:var(--mute)}.grid{display:grid;gap:14px;
-grid-template-columns:repeat(auto-fill,minmax(min(100%%,480px),1fr))}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+padding:52px 16px 24px}main{max-width:1500px;margin:0 auto}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.4rem 1rem;margin-bottom:14px}
+h1{font-size:18px;margin:0}.mute{color:var(--mute)}.grid{display:grid;gap:18px;grid-template-columns:1fr}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
 .card.stale{opacity:.45;filter:grayscale(1)}.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .host{font-weight:650;font-size:16px}.dot{width:9px;height:9px;border-radius:50%%;background:var(--ok)}
 .stale .dot{background:var(--mute)}.pill{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);
 color:var(--mute)}.sub{margin:2px 0 10px;font-size:12px}
-.gpu{display:grid;grid-template-columns:2.2em 1fr auto;gap:2px 10px;align-items:center;padding:6px 0;
-border-top:1px solid var(--line)}.gi{font-weight:650;color:var(--mute)}.gn{font-size:12px;color:var(--mute);
-white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gt{font-size:12px;text-align:right;white-space:nowrap}
-.bars{grid-column:2/4;display:grid;gap:3px}.bar{position:relative;height:14px;border-radius:4px;background:var(--track);
-overflow:hidden}.bar i{position:absolute;inset:0 auto 0 0;background:var(--acc)}.bar b{position:relative;
-font:600 10px/14px system-ui;padding-left:6px}.bar.u i{background:var(--ok)}.bar.hi i{background:var(--warn)}
+/* wide: one row per GPU = id | name + model | util bar | VRAM bar | temp/power; narrow: bars stack full width */
+.gpu{display:grid;grid-template-columns:2em minmax(10em,16em) minmax(0,1fr) minmax(0,1.4fr) 7.5em;gap:6px 16px;
+align-items:center;padding:9px 0;border-top:1px solid var(--line)}.gi{font-weight:650;color:var(--mute)}
+.gn{font-size:13px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gn .tag{display:block;overflow:hidden;text-overflow:ellipsis}.gt{font-size:13px;text-align:right;white-space:nowrap}
+.bars{display:contents}.bar{position:relative;height:22px;border-radius:6px;background:var(--track);overflow:hidden}
+.bar i{position:absolute;inset:0 auto 0 0;background:var(--acc);transition:width .4s}.bar b{position:relative;
+font:600 12px/22px system-ui;padding-left:8px;white-space:nowrap}.bar.u i{background:var(--ok)}.bar.hi i{background:var(--warn)}
+@media (max-width:760px){.gpu{grid-template-columns:2em 1fr auto}.gt{grid-column:3;grid-row:1}
+.bars{display:grid;grid-column:1/-1;gap:5px}}
 .bar.full i{background:var(--hot)}.tag{font-size:11px;color:var(--mute)}
 .model{margin-top:10px;padding:8px 10px;border-radius:8px;background:var(--track)}
 .mname{font-weight:650}.kv{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:12px;color:var(--mute)}
@@ -455,9 +458,9 @@ function render(d){
     const det=p.model_detail||{}, gm={};
     for(const[m,x] of Object.entries(det)) for(const i of x.gpus||[]) (gm[i]=gm[i]||[]).push(m);
     const gpus=(p.gpus||[]).map(x=>{const u=+x.util||0, mp=pct(+x.mem_used,+x.mem_total);
-      return `<div class=gpu><span class=gi>${esc(x.index)}</span><span class=gn>${esc(x.name)}${gm[x.index]?' <span class=tag>- '+esc(gm[x.index].join(", "))+'</span>':''}</span>
-      <span class=gt>${esc(x.temp)} C | ${x.power==null?"-":Math.round(x.power)} W</span><div class=bars>
-      ${bar(u,`util ${u}%%`," u")}${bar(mp,`VRAM ${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`,"")}</div></div>`}).join("");
+      return `<div class=gpu><span class=gi>${esc(x.index)}</span><span class=gn>${esc(x.name)}<span class=tag>${gm[x.index]?esc(gm[x.index].join(", ")):"idle"}</span></span>
+      <div class=bars>${bar(u,`util ${u}%%`," u")}${bar(mp,`VRAM ${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`,"")}</div>
+      <span class=gt>${esc(x.temp)} °C · ${x.power==null?"-":Math.round(x.power)} W</span></div>`}).join("");
     const models=Object.entries(det).map(([m,x])=>{
       const ctx=x.ctx_slot?`${x.ctx_peak.toLocaleString()} / ${x.ctx_slot.toLocaleString()} (${pct(x.ctx_peak,x.ctx_slot).toFixed(0)}%%)`:"-";
       return `<div class=model><span class=mname>${esc(m)}</span> <span class=pill>${esc(x.state)}</span>
