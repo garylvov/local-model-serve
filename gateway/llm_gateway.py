@@ -189,7 +189,9 @@ async def models(req: Request):
     if not authorized(req):
         return err(401, "invalid API key")
     loaded = sorted({m for p in peers.values() if p["ok"] for m, s in p["models"].items() if s == "loaded"})
-    return JSONResponse({"object": "list", "data": [{"id": m, "object": "model", "owned_by": "llm"} for m in loaded]})
+    # router-style "status" lets llama.cpp's WebUI (props role=router) list the models as usable
+    return JSONResponse({"object": "list", "data": [{"id": m, "object": "model", "owned_by": "llm", "aliases": [],
+                                                      "tags": [], "status": {"value": "loaded"}} for m in loaded]})
 
 
 def session_key(req: Request, body: dict):
