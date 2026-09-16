@@ -1,0 +1,15 @@
+# weights, builds, envs, runtime state
+/models/
+/vendor/
+/run/
+/.venv/
+/.cache/
+__pycache__/
+*.pyc
+# registry: live node files and the real static file are local state
+/registry/*.json
+/registry/static.yaml
+# never commit secrets
+*.key
+*.env
+!*.env.example
