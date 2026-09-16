@@ -603,6 +603,9 @@ def session_key(req: Request, body: dict):
     return uid or body.get("user")
 
 
+inflight_by_replica: dict = {}   # (peer url, concrete model id) -> in-flight requests
+
+
 def base_name(model_id: str) -> str:
     """`qwen3.8-27b@3` -> `qwen3.8-27b`. Replicas are separate router instances of the same weights
     (one per GPU set); clients ask for the base name and the gateway spreads requests over them."""
@@ -623,7 +626,9 @@ def pick(model: str, sess):
     if sess and (sess, model) in pins and pins[(sess, model)][0] in ready:
         url, mid = pins[(sess, model)][0]
     elif ready:
-        url, mid = min(ready, key=lambda c: peers[c[0]]["inflight"])
+        # per-REPLICA in-flight: peers[url]["inflight"] counts the whole machine, so with several
+        # copies on one machine it would send every concurrent request to the same copy.
+        url, mid = min(ready, key=lambda c: (inflight_by_replica.get(c, 0), peers[c[0]]["inflight"]))
     else:
         loadable = [(u, m) for u, m, _ in cands]
         if not loadable:
@@ -683,13 +688,21 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
         query = "&".join(x for x in (query, f"model={replica}") if x)
     q = "&".join(x for x in (query, "autoload=true" if autoload else "") if x)
     headers = {k: v for k, v in req.headers.items() if k.lower() not in hop} | peer_headers(p)
+    rkey = (url, replica) if replica else None
     p["inflight"] += 1
+    if rkey:
+        inflight_by_replica[rkey] = inflight_by_replica.get(rkey, 0) + 1
+
+    def done():
+        p["inflight"] -= 1
+        if rkey:
+            inflight_by_replica[rkey] = max(0, inflight_by_replica.get(rkey, 1) - 1)
     try:
         u, h, ext = await target(url, req.url.path)
         up = await client.send(client.build_request(req.method, u, params=q or None, headers=headers | h,
                                                     content=raw, extensions=ext), stream=True)
     except httpx.HTTPError as e:
-        p["inflight"] -= 1
+        done()
         p["ok"] = False
         return err(502, f"peer unreachable: {type(e).__name__}", anthropic)
 
@@ -699,7 +712,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
                 yield chunk
         finally:
             await up.aclose()
-            p["inflight"] -= 1
+            done()
 
     out = {k: v for k, v in up.headers.items() if k.lower() not in ("content-length", "transfer-encoding", "connection")}
     if (req.method == "GET" and req.url.path in ("/", "/index.html") and up.status_code == 200
@@ -710,7 +723,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
             body = await up.aread()
         finally:
             await up.aclose()
-            p["inflight"] -= 1
+            done()
         # aread() already undoes Content-Encoding (llama.cpp ships the shell pre-gzipped)
         html = body.decode("utf-8", "replace")
         html = html.replace("</body>", CHAT_LAUNCHER + "</body>", 1) if "</body>" in html else html + CHAT_LAUNCHER
@@ -866,20 +879,41 @@ function render(d){
   if(!d.peers.length){g.innerHTML='<div class="card empty mute">No machines are heartbeating.</div>';return}
   g.innerHTML=d.peers.map(p=>{
     const det=p.model_detail||{}, gm={};
-    for(const[m,x] of Object.entries(det)) for(const i of x.gpus||[]) (gm[i]=gm[i]||[]).push(m);
+    // Only LOADED models claim a GPU: an unloaded preset lists the GPUs it *would* use, which
+    // otherwise tags every card with models that are not running.
+    for(const[m,x] of Object.entries(det)) if(x.state==="loaded"||x.state==="loading")
+      for(const i of x.gpus||[]) (gm[i]=gm[i]||[]).push(m);
     const gpus=(p.gpus||[]).map(x=>{const u=+x.util||0, mp=pct(+x.mem_used,+x.mem_total);
       const on=gm[x.index]||[], gc=on.length?modelColor(on[0]):null;   // bars take the model's colour
       const tags=on.map(m=>`<span class=mtag>${dot(m)}${esc(m)}</span>`).join(" ");
       return `<div class=gpu><span class=gi>${esc(x.index)}</span><span class=gn>${esc(x.name)}<span class=tag>${tags||"idle"}</span></span>
       <div class=bars>${bar(u,`util ${u}%%`," u",gc)}${bar(mp,`VRAM ${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`,"",gc)}</div>
       <span class=gt>${esc(x.temp)} °C · ${x.power==null?"-":Math.round(x.power)} W</span></div>`}).join("");
-    const models=Object.entries(det).map(([m,x])=>{
+    // Replicas of one model collapse into a single row (name@1..@N -> name x N).
+    const groups={};
+    for(const[m,x] of Object.entries(det)){const b=m.includes("@")?m.split("@")[0]:m;
+      (groups[b]=groups[b]||[]).push([m,x])}
+    const live=Object.entries(groups).filter(([b,ms])=>ms.some(([,x])=>x.state!=="unloaded"));
+    const idle=Object.entries(groups).filter(([b,ms])=>ms.every(([,x])=>x.state==="unloaded")).map(([b])=>b);
+    const models=live.map(([b,ms])=>{
+      if(ms.length>1){
+        const gpus=ms.flatMap(([,x])=>x.gpus||[]).sort((a,c)=>a-c);
+        const sum=k=>ms.reduce((a,[,x])=>a+(+x[k]||0),0);
+        const up=ms.filter(([,x])=>x.state==="loaded").length;
+        return `<div class=model style="border-left:3px solid ${modelColor(b)}"><span class=mname>${dot(b)}${esc(b)}</span>
+          <span class=pill>${up} of ${ms.length} copies loaded</span>
+          <div class=kv><span>GPUs <b>${gpus.join(", ")||"-"}</b></span>
+          <span>in flight <b>${sum("inflight")}</b></span>
+          <span>slots busy <b>${sum("slots_busy")} / ${sum("slots")}</b></span>
+          <span>one copy <b>${ms[0][1].avg_tok_s??"-"} tok/s</b></span></div></div>`}
+      const [m,x]=ms[0];
       const ctx=x.ctx_slot?`${x.ctx_peak.toLocaleString()} / ${x.ctx_slot.toLocaleString()} (${pct(x.ctx_peak,x.ctx_slot).toFixed(0)}%%)`:"-";
       return `<div class=model style="border-left:3px solid ${modelColor(m)}"><span class=mname>${dot(m)}${esc(m)}</span> <span class=pill>${esc(x.state)}</span>
       <div class=kv><span>GPUs <b>${(x.gpus||[]).join(", ")||"-"}</b></span>
       <span>last 60 s <b>${x.tok_s==null?"-":x.tok_s} tok/s</b></span><span>decode <b>${x.avg_tok_s??"-"} tok/s</b></span>
       <span>in flight <b>${x.inflight??"-"}</b>${x.queued?` (+${x.queued} queued)`:""}</span>
-      <span>slots busy <b>${x.slots_busy??"-"} / ${x.slots??"-"}</b></span><span>peak ctx/slot <b>${ctx}</b></span></div></div>`}).join("");
+      <span>slots busy <b>${x.slots_busy??"-"} / ${x.slots??"-"}</b></span><span>peak ctx/slot <b>${ctx}</b></span></div></div>`}).join("")
+      + (idle.length?`<div class="model mute"><b>not loaded:</b> ${idle.map(esc).join(", ")}</div>`:"");
     return `<section class="card${p.stale?" stale":""}"><div class=top><span class=dot></span><span class=host>${esc(p.host)}</span>
       <span class=pill>${esc(p.kind)}</span><span class=pill>${p.stale?"offline":"online"}</span></div>
       <div class="sub mute">heartbeat ${ago(p.age_s)} ago | ${p.inflight} request(s) via gateway${p.stale?" | drops after "+d.heartbeat_ttl_s+"s":""}</div>
