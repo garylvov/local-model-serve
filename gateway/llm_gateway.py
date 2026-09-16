@@ -6,13 +6,14 @@ field (or ?model=) to a peer with that model loaded (sticky per session header, 
 in-flight); else to a peer that lists it (router autoload); else a JSON 404/503.
 Responses stream through byte for byte. Same shared API key for clients, peers and routers.
 """
-import asyncio, base64, hashlib, hmac, json, os, secrets, time
+import asyncio, base64, hashlib, hmac, json, os, secrets, time, uuid
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs
 
 import httpx
+import yaml
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -24,12 +25,39 @@ POLL, TTL, PIN_TTL = float(os.environ.get("LLM_GW_POLL", 10)), float(os.environ.
 PASSWD = CONF / "passwd"          # scrypt hash written by `llm passwd`
 COOKIE, COOKIE_TTL = "llm_session", 12 * 3600
 LOGIN_WINDOW, LOGIN_MAX = 300, 5  # failed logins per IP per window
+MUTATE_WINDOW, MUTATE_MAX = 60, 20  # model-mutating requests per IP per window (Models tab)
 SESSION_HEADERS = ("x-session-id", "x-litellm-session-id", "x-claude-code-session-id", "session-id", "conversation-id")
 HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "upgrade",
        "authorization", "x-api-key", "accept-encoding", "proxy-authorization",
        # llama-server tool-execution overrides: never let internet clients pick a cwd or a runtime
        # (e.g. "ssh:<host>" / "docker-container:<id>") for POST /tools
        "x-tool-cwd", "x-tool-runtime", "x-resp-type"}
+
+CATALOG_PATH = Path(os.environ.get("LLM_CATALOG", Path(__file__).resolve().parent.parent / "catalog/models.yaml"))
+
+
+def load_catalog() -> dict:
+    try:
+        return (yaml.safe_load(CATALOG_PATH.read_text()) or {}).get("models", {})
+    except (OSError, yaml.YAMLError) as e:
+        print(f"catalog: failed to load {CATALOG_PATH}: {e}", flush=True)
+        return {}
+
+
+CATALOG = load_catalog()  # re-read once at startup; the catalog changes rarely and is not secret
+
+
+def catalog_repos() -> set:
+    return {m["repo"] for m in CATALOG.values() if m.get("repo")}
+
+
+def catalog_quant_gib(hf_repo: str, quant: str | None):
+    for m in CATALOG.values():
+        if m.get("repo") == hf_repo:
+            for q in m.get("quants", []) or []:
+                if q.get("name") == quant or (quant is None and len(m.get("quants", [])) == 1):
+                    return q.get("gib")
+    return None
 
 
 def cf_access_headers() -> dict:
@@ -43,9 +71,59 @@ def cf_access_headers() -> dict:
     return {"CF-Access-Client-Id": ids[0], "CF-Access-Client-Secret": ids[1]} if all(ids) else {}
 
 
-peers: dict = {}   # url -> {seen, cf_access, models: {id: status}, ok, inflight}
+peers: dict = {}   # url -> {seen, cf_access, models: {id: status}, ok, inflight, preset, disk_free_gib, cmd_log}
 pins: dict = {}    # (session, model) -> (url, ts)
+pending_commands: dict = {}  # url -> [{"id", "action", "params"}] ; drained into the next heartbeat response
 client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=None), limits=httpx.Limits(max_connections=2000))
+mutations: dict = {}  # ip -> [timestamps] ; rate limit for Models-tab writes
+
+
+def client_ip_generic(req: Request) -> str:
+    return req.headers.get("cf-connecting-ip") or (req.client.host if req.client else "?")
+
+
+def csrf_ok(req: Request) -> bool:
+    """Same-origin check for mutating Models-tab requests. The login cookie is SameSite=lax, which
+    still allows a top-level cross-site GET to carry it, so every state-changing request needs an
+    explicit same-origin signal too. A request authenticated with the bearer API key (never a
+    cookie) cannot be forged cross-site by a browser in the first place, so it is exempt."""
+    if authorized(req):
+        return True
+    sfs = req.headers.get("sec-fetch-site")
+    if sfs is not None:
+        return sfs in ("same-origin", "none")
+    origin = req.headers.get("origin")
+    if origin:
+        try:
+            return httpx.URL(origin).host == (req.headers.get("host", "").split(":")[0])
+        except Exception:
+            return False
+    return False  # no signal at all: refuse rather than guess
+
+
+def rate_limited(req: Request) -> bool:
+    ip, now = client_ip_generic(req), time.time()
+    hits = [t for t in mutations.get(ip, []) if now - t < MUTATE_WINDOW]
+    hits.append(now)
+    mutations[ip] = hits
+    return len(hits) > MUTATE_MAX
+
+
+def audit(req: Request, action: str, **detail) -> None:
+    ip = client_ip_generic(req)
+    extra = " ".join(f"{k}={v}" for k, v in detail.items())
+    print(f"mutate ip={ip} action={action} {extra}", flush=True)
+
+
+async def guard(req: Request):
+    """Common gate for every mutating Models-tab endpoint: auth, same-origin, rate limit."""
+    if not browser_ok(req):
+        return err(401, "invalid API key")
+    if not csrf_ok(req):
+        return err(403, "cross-site request refused")
+    if rate_limited(req):
+        return err(429, "too many changes; slow down")
+    return None
 
 
 def peer_headers(p: dict) -> dict:
@@ -221,13 +299,21 @@ async def register(req: Request):
         peers.pop(url, None)
         return JSONResponse({"ok": True, "peers": len(peers)})
     new = url not in peers
-    p = peers.setdefault(url, {"models": {}, "ok": False, "inflight": 0, "gpus": [], "host": url})
+    p = peers.setdefault(url, {"models": {}, "ok": False, "inflight": 0, "gpus": [], "host": url,
+                               "preset": {}, "disk_free_gib": None, "cmd_log": []})
     p.update(seen=time.time(), cf_access=bool(body.get("cf_access")),
-             gpus=body.get("gpus") or p.get("gpus") or [], host=body.get("host", url))
+             gpus=body.get("gpus") or p.get("gpus") or [], host=body.get("host", url),
+             preset=body.get("preset") or p.get("preset") or {},
+             disk_free_gib=body.get("disk_free_gib", p.get("disk_free_gib")))
+    for r in (body.get("results") or [])[:20]:
+        entry = {"ts": time.time(), "id": r.get("id"), "ok": bool(r.get("ok")), "msg": str(r.get("msg", ""))[:500]}
+        p["cmd_log"] = (p["cmd_log"] + [entry])[-20:]
+        print(f"command result peer={url} id={entry['id']} ok={entry['ok']} msg={entry['msg']}", flush=True)
     if new:
         print(f"peer {url} registered", flush=True)
         await poll(url)
-    return JSONResponse({"ok": True, "peers": len(peers), "models": p["models"]})
+    cmds = pending_commands.pop(url, [])
+    return JSONResponse({"ok": True, "peers": len(peers), "models": p["models"], "commands": cmds})
 
 
 async def list_peers(req: Request):
@@ -245,6 +331,239 @@ async def models(req: Request):
     # router-style "status" lets llama.cpp's WebUI (props role=router) list the models as usable
     return JSONResponse({"object": "list", "data": [{"id": m, "object": "model", "owned_by": "llm", "aliases": [],
                                                       "tags": [], "status": {"value": "loaded"}} for m in loaded]})
+
+
+def peer_by_host(host: str):
+    for u, p in peers.items():
+        if p.get("host") == host or u == host:
+            return u, p
+    return None, None
+
+
+async def machines(req: Request):
+    """Models tab data source: every peer, its live model states/detail (from poll()) merged with
+    what its preset declares (from the heartbeat), GPUs, free disk and the last command results."""
+    if not browser_ok(req):
+        return err(401, "invalid API key")
+    now = time.time()
+    out = []
+    for u, p in sorted(peers.items()):
+        models_by_id = {m["id"] if isinstance(m, dict) else m: s for m, s in p["models"].items()} if False else p["models"]
+        merged = {}
+        for name, cfg in (p.get("preset") or {}).items():
+            merged[name] = {**cfg, "state": p["models"].get(name, "unloaded"), **p.get("detail", {}).get(name, {})}
+        for name, state in p["models"].items():  # cached-but-not-in-preset models still show up
+            if name not in merged:
+                merged[name] = {"state": state, **p.get("detail", {}).get(name, {})}
+        out.append({"host": p.get("host", u), "ok": p["ok"], "stale": now - p["seen"] > 45 or not p["ok"],
+                    "age_s": round(now - p["seen"]), "gpus": p.get("gpus", []),
+                    "disk_free_gib": p.get("disk_free_gib"), "models": merged,
+                    "cmd_log": p.get("cmd_log", [])})
+    return JSONResponse({"machines": out, "catalog_repos": sorted(catalog_repos())})
+
+
+async def peer_call(p: dict, url: str, method: str, path: str, params=None, json_body=None):
+    u, h, ext = await target(url, path)
+    r = await client.request(method, u, params=params, json=json_body, headers=peer_headers(p) | h,
+                             timeout=20, extensions=ext)
+    return r
+
+
+async def model_action(req: Request):
+    """POST /machines/<host>/models/<model>/load|unload -- immediate, via the router API (no
+    preset edit needed: load/unload just start/stop a child process)."""
+    if (g := await guard(req)) is not None:
+        return g
+    host, model, action = req.path_params["host"], req.path_params["model"], req.path_params["action"]
+    if action not in ("load", "unload"):
+        return err(404, "unknown action")
+    url, p = peer_by_host(host)
+    if not p:
+        return err(404, f"unknown machine {host!r}")
+    if action == "unload":
+        inflight = (p.get("detail", {}).get(model) or {}).get("inflight") or 0
+        body = {}
+        try:
+            body = json.loads(await req.body() or b"{}")
+        except ValueError:
+            pass
+        if inflight and not body.get("confirm"):
+            return err(409, f"{inflight} request(s) in flight for {model}; pass confirm:true to unload anyway")
+    try:
+        r = await peer_call(p, url, "POST", f"/models/{action}", json_body={"model": model})
+    except httpx.HTTPError as e:
+        return err(502, f"peer unreachable: {type(e).__name__}")
+    audit(req, f"model_{action}", host=host, model=model, status=r.status_code)
+    await poll(url)
+    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
+
+
+async def model_download(req: Request):
+    """POST /machines/<host>/models -- start a download via the router's own downloader.
+    Body: {"repo": "<org>/<name>", "quant": "<TAG>"?, "custom_repo": bool?}. Refused unless the
+    repo is in catalog/models.yaml, or the operator explicitly opts in with custom_repo:true
+    (still logged). Capped by the peer's last-reported free disk."""
+    if (g := await guard(req)) is not None:
+        return g
+    host = req.path_params["host"]
+    url, p = peer_by_host(host)
+    if not p:
+        return err(404, f"unknown machine {host!r}")
+    try:
+        body = json.loads(await req.body() or b"{}")
+    except ValueError:
+        return err(400, "body must be JSON")
+    repo, quant, custom = str(body.get("repo", "")).strip(), body.get("quant"), bool(body.get("custom_repo"))
+    if not repo or "/" not in repo:
+        return err(400, "repo required, e.g. org/name")
+    known = repo in catalog_repos()
+    if not known and not custom:
+        return err(400, f"{repo!r} is not in catalog/models.yaml; pass custom_repo:true to override")
+    size_gib = catalog_quant_gib(repo, quant)
+    free = p.get("disk_free_gib")
+    if size_gib is not None and free is not None and size_gib * 1.05 > free:
+        return err(400, f"needs ~{size_gib:.1f} GiB, only {free:.1f} GiB free on {host}")
+    hf_repo = f"{repo}:{quant}" if quant else repo
+    try:
+        r = await peer_call(p, url, "POST", "/models", json_body={"model": hf_repo})
+    except httpx.HTTPError as e:
+        return err(502, f"peer unreachable: {type(e).__name__}")
+    audit(req, "model_download", host=host, repo=hf_repo, custom_repo=custom, status=r.status_code)
+    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
+
+
+async def model_delete(req: Request):
+    if (g := await guard(req)) is not None:
+        return g
+    host, model = req.path_params["host"], req.path_params["model"]
+    url, p = peer_by_host(host)
+    if not p:
+        return err(404, f"unknown machine {host!r}")
+    try:
+        body = json.loads(await req.body() or b"{}")
+    except ValueError:
+        body = {}
+    if not body.get("confirm"):
+        return err(409, "delete is destructive; pass confirm:true")
+    try:
+        r = await peer_call(p, url, "DELETE", "/models", params={"model": model})
+    except httpx.HTTPError as e:
+        return err(502, f"peer unreachable: {type(e).__name__}")
+    audit(req, "model_delete", host=host, model=model, status=r.status_code)
+    await poll(url)
+    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
+
+
+async def model_sse(req: Request):
+    """Proxy the router's live /models/sse for download/load progress. Falls back to polling in
+    the UI if this 502s (peer unreachable / SSE not supported by this build)."""
+    if not browser_ok(req):
+        return err(401, "invalid API key")
+    host = req.path_params["host"]
+    url, p = peer_by_host(host)
+    if not p:
+        return err(404, f"unknown machine {host!r}")
+    try:
+        u, h, ext = await target(url, "/models/sse")
+        up = await client.send(client.build_request("GET", u, headers=peer_headers(p) | h, extensions=ext),
+                               stream=True)
+    except httpx.HTTPError as e:
+        return err(502, f"peer unreachable: {type(e).__name__}")
+
+    async def relay():
+        try:
+            async for chunk in up.aiter_raw():
+                yield chunk
+        finally:
+            await up.aclose()
+    return StreamingResponse(relay(), status_code=up.status_code, media_type="text/event-stream")
+
+
+# ---- placement (preset) editing: queued as a pull command, applied by bin/llm on its next beat --
+ALLOWED_PATCH_KEYS = {"device", "ctx-size", "parallel", "no-mmproj", "threads", "hf-repo", "quant",
+                      "image-min-tokens", "image-max-tokens", "n-gpu-layers"}
+
+
+def vram_fit_warning(p: dict, gpu_idxs: list, hf_repo: str, quant) -> str | None:
+    gpu_by_idx = {g["index"]: g for g in p.get("gpus", [])}
+    missing = [i for i in gpu_idxs if i not in gpu_by_idx]
+    if missing:
+        return f"GPU(s) {missing} do not exist on {p.get('host')} (has {sorted(gpu_by_idx)})"
+    size_gib = catalog_quant_gib(hf_repo, quant)
+    if size_gib is None or not gpu_idxs:
+        return None
+    total_mib = sum(gpu_by_idx[i]["mem_total"] for i in gpu_idxs)
+    need_mib = size_gib * 1024 * 1.12  # ~12% headroom for KV cache + compute buffers (README budget)
+    if need_mib > total_mib:
+        return (f"{hf_repo}:{quant} needs ~{need_mib/1024:.1f} GiB (incl. KV/compute headroom) "
+                f"but GPU(s) {gpu_idxs} only have {total_mib/1024:.1f} GiB total")
+    return None
+
+
+async def set_preset(req: Request):
+    if (g := await guard(req)) is not None:
+        return g
+    host = req.path_params["host"]
+    url, p = peer_by_host(host)
+    if not p:
+        return err(404, f"unknown machine {host!r}")
+    try:
+        body = json.loads(await req.body() or b"{}")
+    except ValueError:
+        return err(400, "body must be JSON")
+    section, patch = body.get("model"), body.get("patch")
+    if not section or not isinstance(patch, dict) or not patch:
+        return err(400, "body must be {model, patch:{...}}")
+    bad = set(patch) - ALLOWED_PATCH_KEYS
+    if bad:
+        return err(400, f"unknown key(s): {sorted(bad)}")
+    cfg = (p.get("preset") or {}).get(section, {})
+    patch = dict(patch)
+    if "quant" in patch:   # UI-only field: the INI encodes quant as a ":TAG" suffix on hf-repo
+        base = str(patch.get("hf-repo") or cfg.get("hf_repo") or "").split(":", 1)[0]
+        if not base:
+            return err(400, "quant given without a known hf-repo for this model")
+        patch["hf-repo"] = f"{base}:{patch.pop('quant')}" if patch["quant"] else base
+        patch.pop("quant", None)
+    gpu_idxs = None
+    if "device" in patch:
+        val = str(patch["device"])
+        try:
+            gpu_idxs = [int(t[4:]) for t in val.split(",") if t] if val else []
+        except ValueError:
+            return err(400, f"bad device value: {val!r}")
+    hf_repo_full = str(patch.get("hf-repo") or (f"{cfg['hf_repo']}:{cfg['quant']}" if cfg.get("hf_repo") and cfg.get("quant")
+                                                 else cfg.get("hf_repo") or ""))
+    hf_repo, _, quant = hf_repo_full.partition(":")
+    warn = vram_fit_warning(p, gpu_idxs if gpu_idxs is not None else (cfg.get("gpus") or []), hf_repo, quant or None) \
+        if hf_repo else None
+    if warn and not body.get("force"):
+        return err(400, f"placement rejected: {warn}")
+    cid = uuid.uuid4().hex[:12]
+    pending_commands.setdefault(url, []).append(
+        {"id": cid, "action": "set_preset", "params": {"section": section, "patch": {k: str(v) for k, v in patch.items()}}})
+    audit(req, "set_preset", host=host, model=section, patch=patch, warn=bool(warn))
+    return JSONResponse({"ok": True, "queued": cid, "applies_within_s": 30, "warning": warn})
+
+
+async def restart_router(req: Request):
+    if (g := await guard(req)) is not None:
+        return g
+    host = req.path_params["host"]
+    url, p = peer_by_host(host)
+    if not p:
+        return err(404, f"unknown machine {host!r}")
+    try:
+        body = json.loads(await req.body() or b"{}")
+    except ValueError:
+        body = {}
+    any_loaded = any(v == "loaded" for v in p["models"].values())
+    if any_loaded and not body.get("confirm"):
+        return err(409, "restarting will drop every loaded model on this machine; pass confirm:true")
+    cid = uuid.uuid4().hex[:12]
+    pending_commands.setdefault(url, []).append({"id": cid, "action": "restart_router", "params": {}})
+    audit(req, "restart_router", host=host)
+    return JSONResponse({"ok": True, "queued": cid, "applies_within_s": 30})
 
 
 def session_key(req: Request, body: dict):
@@ -342,7 +661,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
             p["inflight"] -= 1
         # aread() already undoes Content-Encoding (llama.cpp ships the shell pre-gzipped)
         html = body.decode("utf-8", "replace")
-        bar = TABBAR % (ACTIVE, "")
+        bar = TABBAR % (ACTIVE, "", "")
         html = html.replace("</body>", bar + "</body>", 1) if "</body>" in html else html + bar
         out = {k: v for k, v in out.items() if k.lower() not in ("content-encoding", "etag")}
         out["cache-control"] = "no-store"
@@ -410,6 +729,7 @@ TABBAR = ("<nav id=llm-tabs style=\"position:fixed;top:6px;left:50%%;transform:t
           "background:rgba(127,127,127,.22);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)\">"
           "<a href=/ style=\"padding:4px 12px;border-radius:999px;color:inherit;text-decoration:none;%s\">Chat</a>"
           "<a href=/status style=\"padding:4px 12px;border-radius:999px;color:inherit;text-decoration:none;%s\">Hardware</a>"
+          "<a href=/models-ui style=\"padding:4px 12px;border-radius:999px;color:inherit;text-decoration:none;%s\">Models</a>"
           "</nav>")
 ACTIVE = "background:rgba(127,127,127,.35)"
 
@@ -484,7 +804,163 @@ tick();
 async def status_page(req: Request):
     if not browser_ok(req):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(HARDWARE_HTML % {"tabs": TABBAR % ("", ACTIVE)}, headers={"cache-control": "no-store"})
+    return HTMLResponse(HARDWARE_HTML % {"tabs": TABBAR % ("", ACTIVE, "")}, headers={"cache-control": "no-store"})
+
+
+MODELS_HTML = """<!doctype html><html lang=en><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Models - llm.garylvov.com</title>
+<meta name=color-scheme content="light dark"><style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mute:#6b7280;--line:#e5e7eb;--track:#e9ecf0;--ok:#16a34a;
+--warn:#d97706;--hot:#dc2626;--acc:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#161b22;--fg:#e6edf3;--mute:#8b949e;--line:#262c36;
+--track:#232a33;--ok:#3fb950;--warn:#d29922;--hot:#f85149;--acc:#58a6ff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;
+padding:52px 16px 24px}main{max-width:1100px;margin:0 auto}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.4rem 1rem;margin-bottom:14px}
+h1{font-size:18px;margin:0}.mute{color:var(--mute)}.grid{display:grid;gap:18px;grid-template-columns:1fr}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card.stale{opacity:.45;filter:grayscale(1)}.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.host{font-weight:650;font-size:16px}.pill{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);
+color:var(--mute)}.pill.loaded{color:var(--ok);border-color:var(--ok)}.pill.loading,.pill.downloading{color:var(--warn);border-color:var(--warn)}
+.sub{margin:2px 0 10px;font-size:12px}
+.model{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--track)}
+.mrow{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.mname{font-weight:650}.kv{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:12px;color:var(--mute);margin-top:4px}
+.kv b{color:var(--fg);font-weight:600}
+button{font:600 12px system-ui;padding:5px 10px;border-radius:6px;border:1px solid var(--line);
+background:var(--card);color:var(--fg);cursor:pointer}button:hover{border-color:var(--acc)}
+button.danger:hover{border-color:var(--hot);color:var(--hot)}button:disabled{opacity:.5;cursor:default}
+button.edit{margin-left:auto}
+.form{display:none;margin-top:10px;padding:10px;border-top:1px dashed var(--line);gap:8px 14px;
+grid-template-columns:repeat(auto-fit,minmax(110px,1fr))}
+.form.open{display:grid}.form label{font-size:11px;color:var(--mute);display:block;margin-bottom:2px}
+.form input,.form select{width:100%%;font:inherit;padding:4px 6px;border-radius:5px;border:1px solid var(--line);
+background:var(--bg);color:var(--fg)}
+.gpus{display:flex;flex-wrap:wrap;gap:4px}.gpus label{display:flex;align-items:center;gap:3px;font-size:11px;
+border:1px solid var(--line);border-radius:5px;padding:2px 6px;cursor:pointer;margin:0}
+.formrow{grid-column:1/-1;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.err{color:var(--hot);font-size:12px}.warn{color:var(--warn);font-size:12px}
+.dl{margin-top:10px;padding:10px;border-radius:8px;background:var(--track);display:grid;gap:6px}
+.dl input{font:inherit;padding:5px 7px;border-radius:5px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+progress{width:100%%;height:8px}
+.empty{padding:30px;text-align:center}
+</style>%(tabs)s<main><header><h1>Models</h1><span class=mute id=ts>loading...</span></header>
+<div class=grid id=grid></div></main>
+<script>
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let DATA={machines:[]};
+async function api(path,opts){
+  const r=await fetch(path,{credentials:"same-origin",...opts});
+  let body=null; try{body=await r.json()}catch(e){}
+  if(!r.ok) throw new Error((body&&(body.error&&body.error.message||body.error))||(r.status+" "+r.statusText));
+  return body;
+}
+function stateClass(s){return s==="loaded"?"loaded":(s==="loading"||s==="downloading")?"loading":""}
+async function doLoad(host,model){
+  const btn=event.target; btn.disabled=true;
+  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/load`,{method:"POST"}); await tick()}
+  catch(e){alert("load failed: "+e.message)} finally{btn.disabled=false}
+}
+async function doUnload(host,model,inflight){
+  if(inflight>0 && !confirm(`${model} has ${inflight} request(s) in flight on ${host}. Unload anyway?`))return;
+  const btn=event.target; btn.disabled=true;
+  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/unload`,
+    {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:inflight>0})}); await tick()}
+  catch(e){alert("unload failed: "+e.message)} finally{btn.disabled=false}
+}
+async function doDelete(host,model){
+  if(!confirm(`Permanently delete the downloaded weights for ${model} on ${host}?`))return;
+  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}`,
+    {method:"DELETE",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:true})}); await tick()}
+  catch(e){alert("delete failed: "+e.message)}
+}
+function toggleForm(id){const f=document.getElementById(id);f.classList.toggle("open")}
+async function savePlacement(host,model,formId){
+  const f=document.getElementById(formId);
+  const gpus=[...f.querySelectorAll(".gpu-cb:checked")].map(c=>"CUDA"+c.value).join(",");
+  const patch={device:gpus, "ctx-size":f.querySelector(".f-ctx").value, parallel:f.querySelector(".f-par").value,
+    "no-mmproj":f.querySelector(".f-mmproj").checked?"false":"true"};
+  const errEl=f.querySelector(".form-err"); errEl.textContent="";
+  try{
+    const r=await api(`/machines/${encodeURIComponent(host)}/preset`,{method:"POST",
+      headers:{"content-type":"application/json"}, body:JSON.stringify({model, patch})});
+    errEl.className="warn"; errEl.textContent=r.warning?("queued, but: "+r.warning):"queued - applies within ~30s (next heartbeat)";
+  }catch(e){errEl.className="err"; errEl.textContent=e.message}
+}
+async function startDownload(host,formId){
+  const f=document.getElementById(formId);
+  const repo=f.querySelector(".dl-repo").value.trim(), quant=f.querySelector(".dl-quant").value.trim();
+  const custom=f.querySelector(".dl-custom").checked;
+  const errEl=f.querySelector(".dl-err"); errEl.textContent="";
+  try{
+    await api(`/machines/${encodeURIComponent(host)}/models`,{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({repo, quant: quant||undefined, custom_repo: custom})});
+    errEl.className="warn"; errEl.textContent="download started";
+    await tick();
+  }catch(e){errEl.className="err"; errEl.textContent=e.message}
+}
+function render(d){
+  DATA=d;
+  document.getElementById("ts").textContent="updated "+new Date().toLocaleTimeString();
+  const g=document.getElementById("grid");
+  if(!d.machines.length){g.innerHTML='<div class="card empty mute">No machines are heartbeating.</div>';return}
+  g.innerHTML=d.machines.map((m,mi)=>{
+    const gpuList=(m.gpus||[]).map(x=>x.index);
+    const models=Object.entries(m.models||{}).map(([name,x],i)=>{
+      const fid=`f-${mi}-${i}`;
+      const gpus=x.gpus||[];
+      const gpuCbs=gpuList.map(gi=>`<label><input type=checkbox class=gpu-cb value="${gi}" ${gpus.includes(gi)?"checked":""}>${gi}</label>`).join("");
+      const loaded=x.state==="loaded";
+      return `<div class=model>
+        <div class=mrow><span class=mname>${esc(name)}</span><span class="pill ${stateClass(x.state)}">${esc(x.state||"unloaded")}</span>
+        ${loaded?`<button class=danger onclick="doUnload('${esc(m.host)}','${esc(name)}',${x.inflight||0})">Unload</button>`
+                :`<button onclick="doLoad('${esc(m.host)}','${esc(name)}')">Load</button>`}
+        <button class=danger onclick="doDelete('${esc(m.host)}','${esc(name)}')">Delete weights</button>
+        <button class=edit onclick="toggleForm('${fid}')">Edit placement</button></div>
+        <div class=kv><span>GPUs <b>${gpus.join(", ")||"-"}</b></span>
+        ${x.quant?`<span>quant <b>${esc(x.quant)}</b></span>`:""}
+        ${x.ctx_size||x.ctx_slot?`<span>ctx <b>${(x.ctx_size||x.ctx_slot).toLocaleString()}</b></span>`:""}
+        ${x.parallel?`<span>parallel <b>${x.parallel}</b></span>`:""}
+        ${x.avg_tok_s?`<span>decode <b>${x.avg_tok_s} tok/s</b></span>`:""}
+        ${x.inflight!=null?`<span>in flight <b>${x.inflight}</b></span>`:""}</div>
+        <div class=form id="${fid}">
+          <div><label>GPUs</label><div class=gpus>${gpuCbs||"<span class=mute>no GPU data</span>"}</div></div>
+          <div><label>ctx-size</label><input class=f-ctx type=number value="${x.ctx_size||x.ctx_slot||131072}"></div>
+          <div><label>parallel</label><input class=f-par type=number value="${x.parallel||4}"></div>
+          <div><label>mmproj</label><label style="display:flex;align-items:center;gap:4px;border:none;padding:0">
+            <input class=f-mmproj type=checkbox ${x.no_mmproj?"":"checked"}> enabled</label></div>
+          <div class=formrow><button onclick="savePlacement('${esc(m.host)}','${esc(name)}','${fid}')">Save (writes preset, applies on next heartbeat)</button>
+          <span class="form-err mute"></span></div>
+        </div>
+      </div>`}).join("") || '<div class="model mute">no models in this machine\\'s preset</div>';
+    const dlid=`dl-${mi}`;
+    return `<section class="card${m.stale?" stale":""}"><div class=top><span class=host>${esc(m.host)}</span>
+      <span class=pill>${m.stale?"offline":"online"}</span>
+      ${m.disk_free_gib!=null?`<span class=pill>${m.disk_free_gib.toFixed?m.disk_free_gib.toFixed(1):m.disk_free_gib} GiB free</span>`:""}</div>
+      <div class="sub mute">${gpuList.length} GPU(s)</div>
+      ${models}
+      <div class=dl id="${dlid}"><div class=mrow><b>Download a model</b></div>
+        <div class=mrow><input class=dl-repo placeholder="org/repo (from catalog)" style="flex:2;min-width:12em">
+        <input class=dl-quant placeholder="quant tag e.g. UD-Q4_K_XL" style="flex:1;min-width:10em">
+        <label style="display:flex;align-items:center;gap:4px;font-size:12px"><input type=checkbox class=dl-custom> custom repo</label>
+        <button onclick="startDownload('${esc(m.host)}','${dlid}')">Start</button></div>
+        <span class="dl-err mute"></span>
+        <span class=mute style="font-size:11px">Catalog repos: ${esc((d.catalog_repos||[]).slice(0,6).join(", "))}${d.catalog_repos&&d.catalog_repos.length>6?"...":""}</span>
+      </div>
+      </section>`}).join("");
+}
+async function tick(){try{const r=await fetch("/machines",{credentials:"same-origin",cache:"no-store"});
+  if(r.status===401){location.href="/login";return} render(await r.json())}
+  catch(e){document.getElementById("ts").textContent="connection lost, retrying..."}
+  setTimeout(tick,4000)}
+tick();
+</script></html>"""
+
+
+async def models_page(req: Request):
+    if not browser_ok(req):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(MODELS_HTML % {"tabs": TABBAR % ("", "", ACTIVE)}, headers={"cache-control": "no-store"})
 
 
 async def health(_req: Request):
@@ -504,6 +980,14 @@ routes = Starlette(lifespan=lifespan, routes=[
     Route("/status", status_page), Route("/status.json", status_json),
     Route("/peers/register", register, methods=["POST"]), Route("/peers/deregister", register, methods=["POST"]),
     Route("/v1/models", models), Route("/models", models),
+    Route("/models-ui", models_page),
+    Route("/machines", machines),
+    Route("/machines/{host}/models/{model}/{action}", model_action, methods=["POST"]),
+    Route("/machines/{host}/models/sse", model_sse),
+    Route("/machines/{host}/models", model_download, methods=["POST"]),
+    Route("/machines/{host}/models/{model}", model_delete, methods=["DELETE"]),
+    Route("/machines/{host}/preset", set_preset, methods=["POST"]),
+    Route("/machines/{host}/restart", restart_router, methods=["POST"]),
     Route("/{path:path}", proxy, methods=["GET", "POST"]),
 ])
 

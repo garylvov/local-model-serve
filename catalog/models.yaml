@@ -34,7 +34,7 @@ models:
       - {name: UD-Q5_K_XL, file: Qwen3.8-27B-UD-Q5_K_XL.gguf, gib: 19.44, fits: 2 GPUs}
       - {name: Q8_0, file: Qwen3.8-27B-Q8_0.gguf, gib: 27.05, fits: 2 GPUs}
       - {name: UD-Q8_K_XL, file: Qwen3.8-27B-UD-Q8_K_XL.gguf, gib: 29.30, fits: 2 GPUs}
-      - {name: BF16, file: BF16/Qwen3.8-27B-BF16-0000{1,2}-of-00002.gguf, gib: 50.90, fits: 3 GPUs}
+      - {name: BF16, file: "BF16/Qwen3.8-27B-BF16-0000{1,2}-of-00002.gguf", gib: 50.90, fits: 3 GPUs}
     issues: ["#27139 Codex fails with the Qwen3.8 chat template (verify tool round-trip)",
              "#27829 DFlash2 drafter + `-sm tensor` aborts"]
     verified: true
