@@ -24,4 +24,32 @@ builds:
     cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
     for: [glm-5.3-flash]
     status: NOT built (experiment gated on the Qwen3.8 bring-up; weights are 146 GiB)
-    notes: needs NVIDIA_TF32_OVERRIDE=0 and -fa off per the PR; watch issue #26027 (GLM_DSA CUDA corruption)
+    notes: |
+      Needs NVIDIA_TF32_OVERRIDE=0 and -fa off per the PR; watch issue #26027 (GLM_DSA CUDA
+      corruption). 2026-09-16 operator check: #27754 (danielhanchen) is the only one of three
+      competing PRs (#27752 text-only, #27773 alternative) still mergeable against master; 45
+      commits, updated today. Image support needs the unsloth GGUFs. Long-context SOFT_MAX crash
+      fixes exist in forks, see #28282 (not confirmed merged into this PR - check before trusting
+      long ctx).
+
+  qwen-mtp:
+    remote: https://github.com/ggml-org/llama.cpp
+    ref: refs/pull/28243/head   # "models: Qwen3.8-Flash-Next MTP" - draft, mergeable_state dirty
+    dir: vendor/llama.cpp-qwen-mtp
+    cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
+    for: [qwen3.8-flash-next, qwen3.8-27b]   # MTP draft weights exist for both (unsloth, see notes)
+    status: NOT built (2026-09-16 registry pass; build attempted separately, see _out.md)
+    notes: |
+      Still a DRAFT as of 2026-09-16, head fork danielhanchen/llama.cpp branch qwen4exp/mtp,
+      mergeable_state=dirty because #28896 landed first and now conflicts (a reviewer asked for a
+      rebase). refs/pull/28243/head is the PR's own tip commit, independent of that merge-ability
+      flag, so it clones/builds fine even while dirty - do NOT try to rebase it here; if it stops
+      building against a newer master, re-pin to the PR's latest head commit instead. Builds on
+      top of PR #27836. Claims 1.3-2x decode speedup. Known bug: #27102, a CUDA-graph crash on
+      Blackwell with this branch (not our arch, A5000/Ampere sm_86 - unconfirmed here either way,
+      check for it explicitly). One commenter validated CUDA + Vulkan on consumer cards.
+      Official MTP draft weights confirmed on HF (2026-09-16, HF tree API):
+        unsloth/Qwen3.8-Flash-Next-GGUF: MTP/mtp-Qwen3.8-Flash-Next-{BF16 7.77G, Q4_K_M 2.79G, ...}
+        unsloth/Qwen3.8-27B-GGUF: MTP/mtp-Qwen3.8-27B-Q4_0.gguf (1.27 GiB)
+      Vision must NOT share a process with a draft model: mmproj + speculative decoding stalls
+      ~500s and returns HTTP 500 on image requests (#27408, already true of qwen3.8-27b-vision).

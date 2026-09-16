@@ -23,6 +23,7 @@ models:
     match: [qwen, qwen3.8, qwen27b, fast, dense]
     repo: unsloth/Qwen3.8-27B-GGUF
     arch: qwen35            # llama.cpp PR #19435/#19468 (Feb 2026)
+    build: master           # MTP speculative decoding needs build: qwen-mtp (catalog/builds.yaml) - NOT built yet
     arch_supported: true
     params: 27.8B dense
     tags: [tools, reasoning, vision, fim]
@@ -43,6 +44,7 @@ models:
     match: [flashnext, flash, next, big, main]
     repo: unsloth/Qwen3.8-Flash-Next-GGUF
     arch: qwen4exp           # llama.cpp PR #27742 (merged 2026-08-27)
+    build: master           # MTP speculative decoding needs build: qwen-mtp (catalog/builds.yaml) - NOT built yet
     arch_supported: true
     params: 180B total / ~6B active MoE (125B + 51B n-gram embedding + 4B MTP)
     tags: [tools, reasoning, vision]
@@ -132,6 +134,7 @@ models:
     match: [glm, glm5, glmflash]
     repo: unsloth/GLM-5.3-Flash-GGUF
     arch: glm5next
+    build: glm53             # catalog/builds.yaml: PR #27754 (the only one of the three still mergeable)
     arch_supported: false    # needs one of the open PRs #27752 / #27754 / #27773
     params: 321B total / 18B active
     tags: [tools, reasoning, vision]
