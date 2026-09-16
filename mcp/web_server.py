@@ -168,6 +168,10 @@ def fetch(url: str, max_chars: int = MAX_CHARS) -> dict:
 
 
 # --------------------------------------------------------------------------- search
+# Tried in order; "auto" is ddgs's own rotation and makes a decent last resort.
+SEARCH_BACKENDS = ("brave", "bing", "yahoo", "duckduckgo", "mojeek", "auto")
+
+
 def search(query: str, max_results: int = 6) -> dict:
     t0 = time.monotonic()
     n = max(1, min(int(max_results or 6), 10))
@@ -181,10 +185,23 @@ def search(query: str, max_results: int = 6) -> dict:
                    for x in r.json().get("web", {}).get("results", [])[:n]]
         engine = "brave"
     else:
+        # Keyless search: any single engine rate-limits us into "No results found" (measured
+        # 2026-09-16 — duckduckgo, google and mojeek all returned nothing while brave, bing and
+        # yahoo answered the same query). Rotate; fail only when every engine has.
         from ddgs import DDGS
-        results = [{"title": x.get("title", ""), "url": x.get("href", ""), "snippet": x.get("body", "")}
-                   for x in DDGS(timeout=int(TIMEOUT)).text(query, max_results=n, backend="duckduckgo")]
-        engine = "duckduckgo"
+        errors, results, engine = [], [], None
+        for backend in SEARCH_BACKENDS:
+            try:
+                hits = DDGS(timeout=int(TIMEOUT)).text(query, max_results=n, backend=backend)
+                results = [{"title": x.get("title", ""), "url": x.get("href", ""), "snippet": x.get("body", "")}
+                           for x in hits]
+                if results:
+                    engine = backend
+                    break
+            except Exception as e:          # per-engine failures are routine; try the next one
+                errors.append(f"{backend}: {type(e).__name__}")
+        if not results:
+            raise RuntimeError("every search engine failed or was empty (" + "; ".join(errors) + ")")
     return {"query": query, "engine": engine, "results": results, "elapsed_s": round(time.monotonic() - t0, 2)}
 
 
