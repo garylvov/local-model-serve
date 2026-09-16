@@ -43,8 +43,17 @@ builds:
     ref: refs/pull/28243/head   # "models: Qwen3.8-Flash-Next MTP" - draft, mergeable_state dirty
     dir: vendor/llama.cpp-qwen-mtp
     cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
-    for: [qwen3.8-flash-next, qwen3.8-27b]   # MTP draft weights exist for both (unsloth, see notes)
-    status: NOT built (2026-09-16 registry pass; build attempted separately, see _out.md)
+    for: [qwen3.8-flash-next, qwen3.8-27b]   # MTP draft weights exist for both (unsloth, see notes) - see caveat below
+    status: |
+      llama-server BUILT on gpu2260 2026-09-16 (~4 min), same `llama-app` gap as glm53 (harmless -
+      only the CLI downloader target, not the router). MEASURED: this binary FAILS to load
+      qwen3.8-27b (UD-Q5_K_XL) - "llama_model_load: error loading model: missing tensor
+      'blk.64.ssm_conv1d.weight'" - i.e. this PR's tree predates (or conflicts with) the qwen35
+      architecture support merged into master separately (PR #19435/#19468), so `for:
+      qwen3.8-27b` above does not actually work with this build today despite unsloth publishing
+      MTP draft weights for it. Not tested against qwen3.8-flash-next (qwen4exp arch, PR #27742) -
+      that would need freeing GPUs 0-5 (currently serving the required flash-next instance) for a
+      103 GiB reload, judged too disruptive to try live; unconfirmed either way.
     notes: |
       Still a DRAFT as of 2026-09-16, head fork danielhanchen/llama.cpp branch qwen4exp/mtp,
       mergeable_state=dirty because #28896 landed first and now conflicts (a reviewer asked for a

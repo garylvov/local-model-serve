@@ -23,7 +23,8 @@ models:
     match: [qwen, qwen3.8, qwen27b, fast, dense]
     repo: unsloth/Qwen3.8-27B-GGUF
     arch: qwen35            # llama.cpp PR #19435/#19468 (Feb 2026)
-    build: master           # MTP speculative decoding needs build: qwen-mtp (catalog/builds.yaml) - NOT built yet
+    build: master           # MTP: the qwen-mtp build (catalog/builds.yaml) FAILS to load this arch
+                             # (missing tensor blk.64.ssm_conv1d.weight, measured 2026-09-16) - no MTP for this model yet
     arch_supported: true
     params: 27.8B dense
     tags: [tools, reasoning, vision, fim]
