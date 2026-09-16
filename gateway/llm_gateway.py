@@ -98,12 +98,45 @@ def browser_ok(req: Request) -> bool:
     return authorized(req) or cookie_ok(req.cookies.get(COOKIE))
 
 
+_dns: dict = {}  # host -> (ip or None, ts)
+
+
+async def resolve(host: str):
+    """Oscar's resolver returns nothing for *.trycloudflare.com (measured 2026-09-16), so when the
+    system resolver fails, ask Cloudflare's DNS-over-HTTPS by IP. Returns an IP to dial, or None."""
+    hit = _dns.get(host)
+    if hit and time.time() - hit[1] < 300:
+        return hit[0]
+    ip = None
+    try:
+        await asyncio.get_running_loop().getaddrinfo(host, 443)
+    except OSError:
+        try:
+            r = await client.get("https://1.1.1.1/dns-query", params={"name": host, "type": "A"},
+                                 headers={"accept": "application/dns-json"}, timeout=5)
+            ip = next((a["data"] for a in r.json().get("Answer", []) if a.get("type") == 1), None)
+        except (httpx.HTTPError, ValueError):
+            pass
+    _dns[host] = (ip, time.time())
+    return ip
+
+
+async def target(base: str, path: str):
+    """(url, extra headers, httpx extensions) - dial a DoH-resolved IP but keep Host + TLS SNI."""
+    u = httpx.URL(base + path)
+    ip = await resolve(u.host) if u.scheme == "https" else None
+    if not ip:
+        return u, {}, {}
+    return u.copy_with(host=ip), {"Host": u.host}, {"sni_hostname": u.host}
+
+
 async def poll(url: str) -> None:
     p = peers.get(url)
     if not p:
         return
     try:
-        r = await client.get(url + "/models", headers=peer_headers(p), timeout=8)
+        u, h, ext = await target(url, "/models")
+        r = await client.get(u, headers=peer_headers(p) | h, timeout=8, extensions=ext)
         r.raise_for_status()
         p["models"] = {m["id"]: m.get("status", {}).get("value", "loaded") for m in r.json().get("data", [])}
         p["ok"] = True
@@ -226,8 +259,9 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
     headers = {k: v for k, v in req.headers.items() if k.lower() not in hop} | peer_headers(p)
     p["inflight"] += 1
     try:
-        up = await client.send(client.build_request(req.method, f"{url}{req.url.path}", params=q or None,
-                                                    headers=headers, content=raw), stream=True)
+        u, h, ext = await target(url, req.url.path)
+        up = await client.send(client.build_request(req.method, u, params=q or None, headers=headers | h,
+                                                    content=raw, extensions=ext), stream=True)
     except httpx.HTTPError as e:
         p["inflight"] -= 1
         p["ok"] = False

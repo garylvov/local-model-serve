@@ -21,7 +21,12 @@ GW_PORT="${LLM_GATEWAY_PORT:-4000}"
 # The gateway runs on a login node so it outlives any Slurm job (no GPU needed).
 # Override with LLM_GATEWAY_HOST / LLM_GATEWAY_URL (or LLM_GATEWAY_URL=none to not join one).
 GW_HOST="${LLM_GATEWAY_HOST:-login009}"
-: "${LLM_GATEWAY_URL:=http://$GW_HOST:$GW_PORT}"
+LLM_PUBLIC_URL="${LLM_PUBLIC_URL:-https://llm.garylvov.com}"
+# On-cluster machines reach the gateway directly; everyone else goes through the public hostname.
+# Detected, never asked: login009 only resolves inside Oscar.
+if getent hosts "$GW_HOST" >/dev/null 2>&1; then ON_CLUSTER=1; else ON_CLUSTER=0; fi
+if (( ON_CLUSTER )); then : "${LLM_GATEWAY_URL:=http://$GW_HOST:$GW_PORT}"
+else : "${LLM_GATEWAY_URL:=$LLM_PUBLIC_URL}"; fi
 
 die() { echo "llm: $*" >&2; exit 1; }
 say() { echo "llm: $*"; }
@@ -144,8 +149,18 @@ gpu_json() { # live per-GPU numbers for the gateway status page (no prompts, no 
        mem_total: (.[4]|tonumber), temp: (.[5]|tonumber), power: (.[6]|tonumber? // null)})' || echo "[]"
 }
 
+peer_url() { # what the gateway should call back on
+  if [[ -n "${LLM_PEER_URL:-}" ]]; then echo "$LLM_PEER_URL"; return; fi
+  # quick tunnel: take the most recent trycloudflare URL cloudflared printed (it changes on restart)
+  if tmux has-session -t ="$SESSION-tunnel" 2>/dev/null && [[ -f "$RUN/tunnel.log" ]]; then
+    local u; u="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$RUN/tunnel.log" | tail -1 || true)"
+    [[ -n "$u" ]] && { echo "$u"; return; }
+  fi
+  echo "http://$HOST:$PORT"
+}
+
 gw_post() { # gw_post /peers/register|/peers/deregister
-  local body; body="$(jq -nc --arg u "${LLM_PEER_URL:-http://$HOST:$PORT}" --arg h "$HOST" \
+  local body; body="$(jq -nc --arg u "$(peer_url)" --arg h "$HOST" \
     --argjson cf "${LLM_PEER_CF_ACCESS:-false}" --argjson g "$(gpu_json)" \
     '{url: $u, host: $h, cf_access: $cf, gpus: $g}')"
   printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS --max-time 10 -K - -X POST \
@@ -160,9 +175,9 @@ heartbeat() {
            # tmux does not inherit this shell's env, so pass the peer identity explicitly
            tmux new-session -d -s "$SESSION-heartbeat" \
              -e "LLM_SESSION=$SESSION" -e "LLM_PORT=$PORT" -e "LLM_GATEWAY_URL=$LLM_GATEWAY_URL" \
-             -e "LLM_PEER_URL=${LLM_PEER_URL:-http://$HOST:$PORT}" -e "LLM_PEER_CF_ACCESS=${LLM_PEER_CF_ACCESS:-false}" \
+             -e "LLM_PEER_URL=${LLM_PEER_URL:-}" -e "LLM_PEER_CF_ACCESS=${LLM_PEER_CF_ACCESS:-false}" \
              "while true; do '$0' _beat >> '$RUN/heartbeat.log' 2>&1; sleep 30; done"
-           say "heartbeating ${LLM_PEER_URL:-http://$HOST:$PORT} to $LLM_GATEWAY_URL" ;;
+           say "heartbeating $(peer_url) to $LLM_GATEWAY_URL" ;;
     stop)  tmux kill-session -t ="$SESSION-heartbeat" 2>/dev/null || true
            gw_post /peers/deregister >/dev/null 2>&1 && say "deregistered from $LLM_GATEWAY_URL" || true ;;
   esac
@@ -255,26 +270,48 @@ cmd_pull() {
   done
 }
 
-cmd_tunnel() { # this machine's OWN cloudflared connector; token in $CONF/tunnel-token (0600)
+cmd_tunnel() { # this machine's own cloudflared: a named tunnel if a token exists, else a quick tunnel
   local tok="$CONF/tunnel-token" cf; cf="$(type -P cloudflared || echo "$HOME/.local/bin/cloudflared")"
   case "${1:-status}" in
     up)
-      tmux has-session -t =llm-tunnel 2>/dev/null && die "llm-tunnel already running"
-      [[ -r "$tok" && "$(stat -c %a "$tok")" == 600 ]] || die "$tok missing or not mode 0600 (see scripts/cf-machine.sh)"
-      if [[ -r "$HOME/.config/slurm-dash/tunnel-token" ]] && cmp -s "$tok" "$HOME/.config/slurm-dash/tunnel-token"; then
-        die "refusing: that is the Oscar dashboard tunnel token; every machine needs its own tunnel"
-      fi
-      local proto="${LLM_TUNNEL_PROTOCOL:-quic}"
-      tmux new-session -d -s llm-tunnel -e "TUNNEL_TOKEN_FILE=$tok" \
-        "exec '$cf' tunnel --no-autoupdate --protocol $proto run >> '$RUN/tunnel.log' 2>&1"
-      sleep 15
-      if [[ "$proto" == quic ]] && ! tail -n 50 "$RUN/tunnel.log" | grep -q 'Registered tunnel connection'; then
-        say "quic did not register within 15s (UDP blocked?); retrying with http2"
-        tmux kill-session -t =llm-tunnel; LLM_TUNNEL_PROTOCOL=http2 cmd_tunnel up; return
-      fi
-      echo "$proto" > "$RUN/tunnel.protocol"; say "tunnel up ($proto)" ;;
-    down) tmux kill-session -t =llm-tunnel 2>/dev/null; say "tunnel down" ;;
-    status) tmux has-session -t =llm-tunnel 2>/dev/null && say "tunnel up ($(cat "$RUN/tunnel.protocol" 2>/dev/null))" || say "tunnel down" ;;
+      tmux has-session -t ="$SESSION-tunnel" 2>/dev/null && { say "tunnel already running ($(peer_url))"; return 0; }
+      [[ -x "$cf" ]] || die "cloudflared not found (install to ~/.local/bin; see README)"
+      : > "$RUN/tunnel.log"
+      if [[ -r "$tok" ]]; then
+        # named tunnel: token file only, never inline (and never the slurm-dash token)
+        [[ "$(stat -c %a "$tok")" == 600 ]] || die "$tok must be mode 0600"
+        if [[ -r "$HOME/.config/slurm-dash/tunnel-token" ]] && cmp -s "$tok" "$HOME/.config/slurm-dash/tunnel-token"; then
+          die "refusing: that is the Oscar dashboard tunnel token; every machine needs its own"
+        fi
+        local proto="${LLM_TUNNEL_PROTOCOL:-quic}"
+        tmux new-session -d -s "$SESSION-tunnel" -e "TUNNEL_TOKEN_FILE=$tok" \
+          "exec '$cf' tunnel --no-autoupdate --protocol $proto run >> '$RUN/tunnel.log' 2>&1"
+        sleep 15
+        if [[ "$proto" == quic ]] && ! grep -q 'Registered tunnel connection' "$RUN/tunnel.log"; then
+          say "quic did not register in 15s (UDP blocked?); retrying with http2"
+          tmux kill-session -t ="$SESSION-tunnel"; LLM_TUNNEL_PROTOCOL=http2 cmd_tunnel up; return
+        fi
+        echo "$proto" > "$RUN/tunnel.protocol"
+        say "named tunnel up ($proto); peer URL comes from LLM_PEER_URL/DNS"
+      else
+        # quick tunnel: no account, no DNS, no API writes. The URL changes on every start,
+        # which is fine: the heartbeat re-registers the new one and the old entry expires.
+        tmux new-session -d -s "$SESSION-tunnel" \
+          "exec '$cf' tunnel --no-autoupdate --url http://127.0.0.1:$PORT >> '$RUN/tunnel.log' 2>&1"
+        local t0=$SECONDS u=""
+        while (( SECONDS - t0 < 60 )); do
+          u="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$RUN/tunnel.log" | tail -1 || true)"
+          [[ -n "$u" ]] && break
+          tmux has-session -t ="$SESSION-tunnel" 2>/dev/null || die "cloudflared exited; see $RUN/tunnel.log"
+          sleep 2
+        done
+        [[ -n "$u" ]] || die "no trycloudflare URL after 60s (outbound blocked?); see $RUN/tunnel.log"
+        echo quick > "$RUN/tunnel.protocol"
+        say "quick tunnel up: $u -> http://127.0.0.1:$PORT (llama-server's API key still guards it)"
+      fi ;;
+    down) tmux kill-session -t ="$SESSION-tunnel" 2>/dev/null; rm -f "$RUN/tunnel.protocol"; say "tunnel down" ;;
+    status) tmux has-session -t ="$SESSION-tunnel" 2>/dev/null \
+              && say "tunnel up ($(cat "$RUN/tunnel.protocol" 2>/dev/null)): $(peer_url)" || say "tunnel down" ;;
     *) die "usage: llm tunnel up|down|status" ;;
   esac
 }
@@ -298,15 +335,21 @@ cmd_join() { # ONE command to attach this machine: build if needed, serve, regis
   # A shared auth.env already carries the key; otherwise generate one.
   if [[ ! -s "$KEYFILE" && -r "$AUTH" ]]; then (umask 077; sed -n 's/^LLM_API_KEY=//p' "$AUTH" > "$KEYFILE"); fi
   [[ -s "$KEYFILE" ]] || cmd_auth init
+  # Off-cluster machines have no address the gateway can reach, so publish the router through
+  # this machine's own cloudflared before the heartbeat announces a URL.
+  if (( ! ON_CLUSTER )) && [[ -z "${LLM_PEER_URL:-}" ]]; then
+    cmd_tunnel up
+  elif [[ -r "$CONF/tunnel-token" ]]; then
+    cmd_tunnel up
+  fi
   cmd_serve                       # picks the preset by GPU count, starts the heartbeat
-  if [[ -r "$CONF/tunnel-token" ]]; then cmd_tunnel up; fi   # off-cluster machines only
-  say "registered ${LLM_PEER_URL:-http://$HOST:$PORT} with $LLM_GATEWAY_URL"
+  say "registered $(peer_url) with $LLM_GATEWAY_URL"
   cmd_ls
 }
 
 cmd_leave() { # clean the machine out of the gateway and stop serving
   heartbeat stop
-  tmux has-session -t =llm-tunnel 2>/dev/null && cmd_tunnel down
+  tmux has-session -t ="$SESSION-tunnel" 2>/dev/null && cmd_tunnel down
   cmd_stop
   say "left the gateway; nothing of this machine is registered"
 }

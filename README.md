@@ -80,27 +80,47 @@ LLM_PEER_URL=http://<this-host>:8080
 
 `llm serve` then heartbeats every 30 s (tmux `llm-heartbeat`); `llm pause` deregisters.
 
-### Home rig / single GPU
-
-Same as above; `llm serve` picks `presets/single-24g.ini` (or `quad-24g` on 4 GPUs) from the
-GPU count. Off-cluster machines are reached through **their own** Cloudflare tunnel:
+### Home rig (any machine on the open internet)
 
 ```bash
-scripts/cf-machine.sh homerig            # DRY RUN: prints the tunnel/DNS/Access calls to make
-# after the operator applies them by hand, install that machine's own token:
-install -m 600 <token> ~/.config/local-model-serve/tunnel-token
-llm tunnel up                            # cloudflared --protocol quic, auto-falls back to http2
-# and in auth.env:  LLM_PEER_URL=https://homerig.llm-peers.garylvov.com  LLM_PEER_CF_ACCESS=true
+# 1. cloudflared (no Cloudflare account needed for a quick tunnel)
+mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/cloudflared \
+  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x ~/.local/bin/cloudflared
+# 2. the shared key: copy auth.env from an Oscar machine (never paste it into a terminal log)
+ssh oscar 'cd /oscar/data/stellex/glvov/local-model-serve && bin/llm auth print-client' \
+  | (umask 077; mkdir -p ~/.config/local-model-serve && cat > ~/.config/local-model-serve/auth.env)
+# 3. one command
+git clone <repo> ~/local-model-serve && cd ~/local-model-serve && bin/llm join
 ```
 
-The peer hostname is protected by a Cloudflare Access service token; the gateway sends the
-`CF-Access-Client-Id/Secret` headers from `~/.config/local-model-serve/cf-access.env`.
-Agents never see that hostname. **Never reuse the slurm-dash tunnel token** — a second
-connector on it breaks the existing `ccv`/`grove`/`dag` routes.
+What `llm join` does off-cluster, with no arguments:
 
-*Caveat:* you could publish several connectors on one hostname and let Cloudflare load-balance,
-but that is not model-aware (and prefers the nearest connector), which is exactly why the
-gateway exists.
+* **Peer → gateway:** `login009` does not resolve outside Oscar, so `llm` detects that and sends
+  heartbeats to `https://llm.garylvov.com` (on Oscar it uses `http://login009:4000`). The
+  heartbeat authenticates with the bearer key from `auth.env`.
+* **Gateway → peer:** a home rig has no public address, so `llm join` starts a cloudflared
+  **quick tunnel** (`cloudflared tunnel --url http://127.0.0.1:8080`, tmux `llm-tunnel`): no
+  account, no DNS, no API writes. It parses the `https://<random>.trycloudflare.com` URL and the
+  heartbeat registers that. The URL changes whenever cloudflared restarts; every heartbeat
+  re-reads the newest URL from the log, re-registers it, and the stale entry expires after 90 s.
+  llama-server's `--api-key-file` is what protects that public URL.
+* **Stable name instead:** set `LLM_PEER_URL=https://<machine>.llm-peers.garylvov.com` (and
+  `LLM_PEER_CF_ACCESS=true`) after creating a named tunnel with `scripts/cf-machine.sh <machine>`
+  (dry-run; the operator applies it) and installing its token as
+  `~/.config/local-model-serve/tunnel-token` (0600). `llm join` then runs the named tunnel with
+  `--protocol quic` and falls back to `http2`.
+* `llm leave` deregisters and tears down the tunnel and the router.
+
+**Latency caveat:** an off-cluster peer's traffic crosses Cloudflare twice (agent → Cloudflare →
+gateway on login009 → Cloudflare → home rig). Measured on gpu2260 with a quick tunnel standing in
+for a home rig: time to first byte went from 0.18 s direct to 0.34 s through gateway + quick tunnel;
+server-side decode was unchanged (30.2 tok/s), but end-to-end wall time for a 150-token stream
+varied from 3.2 to 5.3 s (vs 2.9–3.0 s direct), i.e. quick tunnels add jitter as well as delay.
+
+**Oscar DNS quirk:** Oscar's resolver (172.20.0.12) returns nothing for `*.trycloudflare.com`
+hostnames even though the public resolvers answer. The gateway therefore falls back to Cloudflare's
+DNS-over-HTTPS (`https://1.1.1.1/dns-query`) for any peer host the system resolver cannot find, and
+dials that IP while keeping the real `Host` header and TLS SNI.
 
 ### Just a client (agent machine)
 

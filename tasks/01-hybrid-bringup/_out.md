@@ -338,6 +338,51 @@ was outside what the brief allows), so the test was the leave/join cycle on gpu2
 README documents the copy-paste lines, including `ssh <node> 'cd <repo> && bin/llm join'` (preferred,
 survives the step) and the `srun --overlap --jobid <id> --pty bash` alternative.
 
+## Off-cluster peers via quick tunnels (operator constraint: home rig cannot reach login009)
+
+Implemented in `bin/llm` (365 lines) and `gateway/llm_gateway.py` (372 lines):
+
+* gateway URL is detected: `getent hosts login009` succeeds → `http://login009:4000`, otherwise
+  `https://llm.garylvov.com` (overridable with `LLM_GATEWAY_URL`/`LLM_PUBLIC_URL`);
+* off-cluster `llm join` (still no arguments) starts `cloudflared tunnel --url http://127.0.0.1:<port>`
+  in tmux `<session>-tunnel`, parses the `*.trycloudflare.com` URL, and the heartbeat registers the
+  newest URL on every beat, so a restarted tunnel re-registers and the old URL expires (90 s);
+  `LLM_PEER_URL` overrides with a stable named-tunnel hostname; `llm leave` tears the tunnel down.
+
+Test on this node (off-cluster simulated with `LLM_GATEWAY_HOST=offcluster-sim.invalid` and the
+gateway URL pinned to `http://login009:4000`, because the public route is still unapplied):
+
+```
+llm join (session llm2, :8081, preset peer-test) ->
+  quick tunnel up: https://bloom-whenever-relocation-billy.trycloudflare.com -> http://127.0.0.1:8081   [4.1 s]
+  registered that URL with http://login009:4000
+tunnel restart -> new URL registered on the next heartbeat; old URL aged out
+login009 /peers: gpu2260:8080 ok [qwen3.8-27b]; bloom-...trycloudflare.com ok [qwen3.8-27b-q4]
+/v1/models: ["qwen3.8-27b","qwen3.8-27b-q4"]
+completion for qwen3.8-27b-q4 via login009 -> quick tunnel -> router :8081: streamed OK
+llm leave -> tunnel down, deregistered, router stopped; /peers == ["http://gpu2260:8080"]
+```
+
+Outbound quick tunnels work from the compute node (QUIC to ewr05). **Blocker found and fixed:** Oscar's
+resolver returns nothing for `*.trycloudflare.com` subdomains (public resolvers 1.1.1.1/8.8.8.8 do),
+so the login009 gateway first logged `ConnectError` for every quick-tunnel peer. The gateway now falls
+back to DNS-over-HTTPS at `https://1.1.1.1/dns-query` and dials the IP with the original Host header
+and TLS SNI; after that the peer went healthy. A pipefail bug that made the first `llm join` exit
+silently while cloudflared was still printing its URL was also fixed.
+
+Latency, 150-token stream, qwen3.8-27b-q4 (3 runs each):
+
+| path | TTFB | wall | server decode |
+| --- | --- | --- | --- |
+| direct to router :8081 | 0.004 / 0.181 / 0.175 s | 3.03 / 3.02 / 2.90 s | 30.1–30.2 tok/s |
+| login009 gateway → quick tunnel → router | 0.340 / 0.340 / 0.347 s | 5.26 / 3.25 / 5.27 s | 30.2–30.3 tok/s |
+
+So the double Cloudflare hop costs ~0.16–0.34 s TTFB plus noticeable delivery jitter; decode speed on
+the peer is unaffected. Not measured: the agent → `https://llm.garylvov.com` leg (route unapplied).
+
+**Also:** the Qwen3.8-Flash-Next UD-Q4_K_XL download finished (all 4 shards present); it has not been
+loaded yet - `bin/llm up flashnext` on GPUs 0-5.
+
 ## Needs an operator decision
 
 1. **Cloudflare route: approved by the operator, but BLOCKED on this machine.** The intended call is
