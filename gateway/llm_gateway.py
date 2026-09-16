@@ -364,7 +364,7 @@ async def lifespan(_app):
     task.cancel()
 
 
-app = Starlette(lifespan=lifespan, routes=[
+routes = Starlette(lifespan=lifespan, routes=[
     Route("/health", health), Route("/peers", list_peers),
     Route("/login", login, methods=["GET", "POST"]),
     Route("/status", status_page), Route("/status.json", status_json),
@@ -372,3 +372,24 @@ app = Starlette(lifespan=lifespan, routes=[
     Route("/v1/models", models), Route("/models", models),
     Route("/{path:path}", proxy, methods=["GET", "POST"]),
 ])
+
+
+async def app(scope, receive, send):
+    """Pure ASGI (keeps streaming intact): via Cloudflare, force HTTPS and send HSTS.
+    Internal http://<gateway>:4000 traffic carries no X-Forwarded-Proto and passes through untouched."""
+    if scope["type"] != "http":
+        return await routes(scope, receive, send)
+    h = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+    proto = h.get("x-forwarded-proto") if "cf-connecting-ip" in h else None
+    if proto == "http":
+        qs = scope.get("query_string", b"").decode()
+        loc = f"https://{h.get('host', '')}{scope['path']}" + (f"?{qs}" if qs else "")
+        return await RedirectResponse(loc, status_code=308)(scope, receive, send)
+
+    async def send_hsts(msg):
+        if proto == "https" and msg["type"] == "http.response.start":
+            msg["headers"] = list(msg.get("headers", [])) + [
+                (b"strict-transport-security", b"max-age=31536000"), (b"x-frame-options", b"DENY"),
+                (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin")]
+        await send(msg)
+    return await routes(scope, receive, send_hsts)
