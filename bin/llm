@@ -183,6 +183,10 @@ heartbeat() {
   esac
 }
 
+cmd_passwd() {  # LLM_PASSWORD=... to set non-interactively
+  mkdir -p "$CONF"; python3 "$ROOT/gateway/set_password.py" "$CONF/passwd"
+}
+
 cmd_gateway() {
   case "${1:-status}" in
     up) tmux has-session -t =llm-gateway 2>/dev/null && { say "gateway already running"; return 0; }
