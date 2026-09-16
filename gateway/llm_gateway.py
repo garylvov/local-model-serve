@@ -342,10 +342,17 @@ async def list_peers(req: Request):
 async def models(req: Request):
     if not browser_ok(req):
         return err(401, "invalid API key")
-    loaded = sorted({m for p in peers.values() if p["ok"] for m, s in p["models"].items() if s == "loaded"})
+    # Replicas (`name@1`, `name@2`, ...) collapse to one entry: clients ask for the base name and
+    # pick() spreads requests across the copies.
+    live = {m for p in peers.values() if p["ok"] for m, s in p["models"].items() if s == "loaded"}
+    copies: dict = {}
+    for m in live:
+        copies.setdefault(base_name(m), []).append(m)
     # router-style "status" lets llama.cpp's WebUI (props role=router) list the models as usable
-    return JSONResponse({"object": "list", "data": [{"id": m, "object": "model", "owned_by": "llm", "aliases": [],
-                                                      "tags": [], "status": {"value": "loaded"}} for m in loaded]})
+    return JSONResponse({"object": "list", "data": [
+        {"id": b, "object": "model", "owned_by": "llm", "aliases": [], "replicas": len(ms),
+         "tags": ([f"{len(ms)} copies"] if len(ms) > 1 else []), "status": {"value": "loaded"}}
+        for b, ms in sorted(copies.items())]})
 
 
 def peer_by_host(host: str):
@@ -596,20 +603,35 @@ def session_key(req: Request, body: dict):
     return uid or body.get("user")
 
 
+def base_name(model_id: str) -> str:
+    """`qwen3.8-27b@3` -> `qwen3.8-27b`. Replicas are separate router instances of the same weights
+    (one per GPU set); clients ask for the base name and the gateway spreads requests over them."""
+    return model_id.rsplit("@", 1)[0] if "@" in model_id else model_id
+
+
+def replicas_of(model: str):
+    """[(peer url, concrete id, loaded?)] for each copy of `model` — exact id or `model@N`."""
+    return [(u, mid, state == "loaded")
+            for u, p in peers.items() if p["ok"]
+            for mid, state in p["models"].items() if mid == model or base_name(mid) == model]
+
+
 def pick(model: str, sess):
-    ready = [u for u, p in peers.items() if p["ok"] and p["models"].get(model) == "loaded"]
+    """-> (peer url, concrete model id, needs-autoload). Sticky per session so the prompt cache hits."""
+    cands = replicas_of(model)
+    ready = [(u, mid) for u, mid, live in cands if live]
     if sess and (sess, model) in pins and pins[(sess, model)][0] in ready:
-        url = pins[(sess, model)][0]
+        url, mid = pins[(sess, model)][0]
     elif ready:
-        url = min(ready, key=lambda u: peers[u]["inflight"])
+        url, mid = min(ready, key=lambda c: peers[c[0]]["inflight"])
     else:
-        loadable = [u for u, p in peers.items() if p["ok"] and model in p["models"]]
+        loadable = [(u, m) for u, m, _ in cands]
         if not loadable:
-            return None, False
-        url = min(loadable, key=lambda u: sum(s == "loaded" for s in peers[u]["models"].values()))
+            return None, None, False
+        url, mid = min(loadable, key=lambda c: sum(s == "loaded" for s in peers[c[0]]["models"].values()))
     if sess:
-        pins[(sess, model)] = (url, time.time())
-    return url, url not in ready
+        pins[(sess, model)] = ((url, mid), time.time())
+    return url, mid, (url, mid) not in ready
 
 
 def default_peer():
@@ -639,19 +661,27 @@ async def proxy(req: Request):
         if not url:
             return err(503, "no peer registered", anthropic)
         return await forward(req, url, raw, autoload, anthropic)
-    url, autoload = pick(model, session_key(req, body))
+    url, mid, autoload = pick(model, session_key(req, body))
     if not url:
-        known = any(model in p["models"] for p in peers.values())
-        return err(503 if known else 404, f"model '{model}' is {'on no healthy peer' if known else 'not served by any peer'}", anthropic)
-    return await forward(req, url, raw, autoload, anthropic)
+        known = any(base_name(m) == model or m == model for p in peers.values() for m in p["models"])
+        return err(503 if known else 404,
+                   f"model '{model}' is " + ("on no healthy peer" if known else
+                                             "not loaded; load it from the Models tab"), anthropic)
+    if mid != model and isinstance(body, dict):   # replica chosen: address the concrete instance
+        raw = json.dumps({**body, "model": mid}).encode()
+    return await forward(req, url, raw, autoload, anthropic, mid if mid != model else None)
 
 
-async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic: bool):
+async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic: bool, replica: str | None = None):
     p = peers[url]
     # Browser (WebUI) paths keep the client's Accept-Encoding so llama.cpp can serve its
     # pre-compressed assets; API paths stay uncompressed so SSE streams are never buffered.
     hop = HOP - {"accept-encoding"} if not req.url.path.startswith(("/v1/", "/chat/")) else HOP
-    q = "&".join(x for x in (str(req.url.query), "autoload=true" if autoload else "") if x)
+    query = str(req.url.query)
+    if replica:   # ?model= must name the concrete replica too (some endpoints route on it)
+        query = "&".join(x for x in query.split("&") if x and not x.startswith("model="))
+        query = "&".join(x for x in (query, f"model={replica}") if x)
+    q = "&".join(x for x in (query, "autoload=true" if autoload else "") if x)
     headers = {k: v for k, v in req.headers.items() if k.lower() not in hop} | peer_headers(p)
     p["inflight"] += 1
     try:
@@ -813,7 +843,10 @@ font:600 12px/22px system-ui;padding-left:8px;white-space:nowrap}.bar.u i{backgr
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pct=(a,b)=>b?Math.max(0,Math.min(100,100*a/b)):0;
 const cls=p=>p>=90?" full":p>=70?" hi":"";
-function bar(p,label,extra){return `<div class="bar${extra}${cls(p)}"><i style="width:${p.toFixed(1)}%%"></i><b>${esc(label)}</b></div>`}
+// `col` (a model colour) overrides the green/amber/red severity fill, so a GPU's util and VRAM
+// bars read as the same colour as the model occupying it.
+function bar(p,label,extra,col){const style=col?`width:${p.toFixed(1)}%%;background:${col}`:`width:${p.toFixed(1)}%%`;
+  return `<div class="bar${extra}${col?"":cls(p)}"><i style="${style}"></i><b>${esc(label)}</b></div>`}
 function ago(s){return s<60?s+"s":Math.floor(s/60)+"m "+(s%%60)+"s"}
 // Stable per-model colour (hash the name -> hue; fixed sat/light reads fine on both the light
 // and dark --card backgrounds). Used as a dot + left border only, never as the util/VRAM bar
@@ -835,9 +868,10 @@ function render(d){
     const det=p.model_detail||{}, gm={};
     for(const[m,x] of Object.entries(det)) for(const i of x.gpus||[]) (gm[i]=gm[i]||[]).push(m);
     const gpus=(p.gpus||[]).map(x=>{const u=+x.util||0, mp=pct(+x.mem_used,+x.mem_total);
-      const tags=(gm[x.index]||[]).map(m=>`<span class=mtag>${dot(m)}${esc(m)}</span>`).join(" ");
+      const on=gm[x.index]||[], gc=on.length?modelColor(on[0]):null;   // bars take the model's colour
+      const tags=on.map(m=>`<span class=mtag>${dot(m)}${esc(m)}</span>`).join(" ");
       return `<div class=gpu><span class=gi>${esc(x.index)}</span><span class=gn>${esc(x.name)}<span class=tag>${tags||"idle"}</span></span>
-      <div class=bars>${bar(u,`util ${u}%%`," u")}${bar(mp,`VRAM ${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`,"")}</div>
+      <div class=bars>${bar(u,`util ${u}%%`," u",gc)}${bar(mp,`VRAM ${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`,"",gc)}</div>
       <span class=gt>${esc(x.temp)} °C · ${x.power==null?"-":Math.round(x.power)} W</span></div>`}).join("");
     const models=Object.entries(det).map(([m,x])=>{
       const ctx=x.ctx_slot?`${x.ctx_peak.toLocaleString()} / ${x.ctx_slot.toLocaleString()} (${pct(x.ctx_peak,x.ctx_slot).toFixed(0)}%%)`:"-";

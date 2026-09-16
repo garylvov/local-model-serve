@@ -11,6 +11,39 @@ agent ──https──> Cloudflare ──> gateway (this repo, :4000) ──> l
                                browser chat + /status
 ```
 
+## Quick start
+
+```bash
+bin/llm join            # any Linux+NVIDIA box: build if needed, start the router, register
+bin/llm ls              # what is loaded, where, and how fast
+bin/llm up qwen         # load a model (fuzzy name); `llm down` unloads
+```
+
+On Oscar a machine registers to the gateway at `login009:4000`; anywhere else `llm join` opens a
+Cloudflare quick tunnel and registers over `https://llm.garylvov.com`. Clients only ever use the
+public URL, with the key from `~/.config/local-model-serve/auth.env`:
+
+```bash
+export OPENAI_BASE_URL=https://llm.garylvov.com/v1 OPENAI_API_KEY=$LLM_API_KEY
+export ANTHROPIC_BASE_URL=https://llm.garylvov.com ANTHROPIC_AUTH_TOKEN=$LLM_API_KEY
+```
+
+The same URL in a browser gives the chat UI, a **Hardware** page (live per-GPU util/VRAM) and a
+**Models** page (load, unload, placement), behind a password set with `llm passwd`.
+
+### Measured on 8× RTX A5000 (2026-09-16)
+
+| model | GPUs | decode | notes |
+| --- | --- | --- | --- |
+| qwen3.8-27b + MTP draft | 2 | **64 tok/s** | 26 tok/s without the draft; 95 % draft acceptance |
+| qwen3.8-27b, 4 concurrent | 2 | 69 tok/s total | batching raises the total, not each stream |
+| qwen3.8-flash-next (Q4) | 6 | 28 tok/s | more GPUs ≠ faster: a layer split runs them in turn |
+
+Prefill is ~1300 tok/s on a 45 k-token prompt. Speculative decoding and replicas (one copy per
+GPU, addressed as one model name) are the two levers that actually raise throughput.
+
+## Layout
+
 * **`bin/llm`** (≈300 lines of bash; `bin/lms` is a symlink) wraps the router and curl.
 * **`presets/*.ini`** are llama.cpp model presets: one section per model, carrying its
   HF repo/quant, GPUs (`device = CUDA6,CUDA7`), context, and flags. `llm serve` picks the
