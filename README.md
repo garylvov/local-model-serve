@@ -30,7 +30,35 @@ in `run/` — none of it is committed.
 
 ## Quick start
 
-### New Oscar node (or any Linux + NVIDIA machine)
+### Attach a new GPU node (one command)
+
+```bash
+cd /oscar/data/stellex/glvov/local-model-serve && bin/llm join
+```
+
+That is the whole thing, and it is safe to re-run. `llm join` detects the GPUs, builds llama.cpp
+only if the pinned build is missing, picks the preset for the GPU count, starts the router in tmux
+`llm` (which auto-loads the preset's `load-on-startup` model), starts the 30 s heartbeat to
+`http://$LLM_GATEWAY_HOST:4000` (default `login009`), and prints the model table. `llm leave`
+deregisters, stops the heartbeat, the tunnel (if any) and the router.
+
+On Oscar, from a login node:
+
+```bash
+salloc -p gpu --gres=gpu:8 -c 60 --mem=900G -t 24:00:00     # new allocation, lands you on the node
+cd /oscar/data/stellex/glvov/local-model-serve && bin/llm join
+
+# or join a node inside an allocation you already hold:
+ssh gpu2260 'cd /oscar/data/stellex/glvov/local-model-serve && bin/llm join'          # preferred: tmux outlives the step
+srun --overlap --jobid <jobid> --pty bash                                             # alternative interactive shell
+```
+
+Prefer the `ssh <node>` form (Slurm allows it on nodes where you hold an allocation): tmux sessions
+started inside an `srun` step can be cleaned up when that step exits, while the ssh form leaves the
+router running for the life of the job. When the job ends the node simply stops heartbeating and the
+gateway drops it within 90 s (it polls every 10 s), so nothing has to be cleaned up by hand.
+
+### New Oscar node (or any Linux + NVIDIA machine), step by step
 
 ```bash
 git clone <repo> /oscar/data/stellex/glvov/local-model-serve && cd $_
