@@ -21,3 +21,4 @@ __pycache__/
 /tasks/
 /mcp/.npm/
 /.playwright-mcp/
+!config.example.env
