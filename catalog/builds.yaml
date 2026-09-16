@@ -23,7 +23,13 @@ builds:
     dir: vendor/llama.cpp-glm53
     cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
     for: [glm-5.3-flash]
-    status: NOT built (experiment gated on the Qwen3.8 bring-up; weights are 146 GiB)
+    status: |
+      llama-server BUILT on gpu2260 2026-09-16 (~6 min, `vendor/llama.cpp-glm53/build/bin/`,
+      807M build dir). `cmake --build --target llama-app` failed with "No rule to make target
+      'llama-app'" - this PR branch predates that CMake target - so `llm build` reports a nonzero
+      exit even though llama-server/llama-cli/llama-bench/llama-gguf-split all linked fine. Not
+      run against real weights (GLM-5.3-Flash weights explicitly not downloaded per operator
+      instruction, 146 GiB).
     notes: |
       Needs NVIDIA_TF32_OVERRIDE=0 and -fa off per the PR; watch issue #26027 (GLM_DSA CUDA
       corruption). 2026-09-16 operator check: #27754 (danielhanchen) is the only one of three
