@@ -1,0 +1,42 @@
+# hybrid: big MiniMax-M2-series model on 6 GPUs + fast Qwen3-Coder on the last NVLink pair.
+# Target: 8x 24 GB (RTX A5000-class) node, >= 512 GB RAM for prompt caches.
+description: MiniMax-M2.7 (GPUs 0-5) + Qwen3-Coder-30B-A3B Q8_0 (GPUs 6-7)
+auto:
+  gpus: 8
+  min_free_vram_mib: 22000
+  max_free_vram_mib: 30000
+  priority: 50
+
+defaults:
+  parallel: 4
+  ctx_per_slot: 65536
+  kv_type: q8_0
+  numa: auto          # auto = bind to the GPUs' NUMA node, interleave if they span nodes
+  args:
+    - --cache-reuse
+    - "256"
+    - --cache-ram     # host-RAM prompt cache (MiB) so agents' growing contexts avoid re-prefill
+    - "65536"
+    - --fit
+    - "off"           # placement is explicit below; fail loudly instead of silently shrinking
+
+instances:
+  minimax:
+    alias: minimax-m2
+    model:
+      repo: unsloth/MiniMax-M2.7-GGUF
+      include: "UD-Q3_K_XL/*"
+      file: UD-Q3_K_XL/MiniMax-M2.7-UD-Q3_K_XL-00001-of-00004.gguf
+    gpus: [0, 1, 2, 3, 4, 5]
+    numa: interleave
+    port: 8101
+    args: [--threads, "28"]
+
+  qwen:
+    alias: qwen3-coder-30b
+    model:
+      repo: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+      file: Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf
+    gpus: [6, 7]
+    port: 8102
+    args: [--threads, "8"]
