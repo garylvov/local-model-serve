@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Make the Agor native daemon reachable from the login node's cloudflared connectors.
+#
+# Shape (two hops, both plain TCP byte relays, no config change to the daemon):
+#
+#   cloudflared (login009)  ->  login009:$AGOR_LOGIN_PORT   [this script's login relay]
+#                           ->  <lease node>:$AGOR_NODE_PORT [srun step inside the lease]
+#                           ->  127.0.0.1:<daemon port>      [the native daemon]
+#
+# Why: `imprint.integrations.agor.native_daemon` starts the daemon with a hard-coded
+# DAEMON_HOST=127.0.0.1, so it binds loopback on whichever compute node holds the
+# current lease. The daemon's sealed config is left alone; the relay sits beside it.
+#
+# Why a supervisor loop rather than a one-shot forward: the daemon MIGRATES between
+# leases. Every REFRESH_SECONDS this script re-reads the live lease from squeue and
+# the live port from that lease's native receipt; when the node, job or port moves it
+# tears both relays down by PID and brings them back pointed at the new lease. No
+# address is stored in this file.
+#
+# Why the node-side hop is a child of this script: `srun --overlap` reaps detached
+# children, so the step only survives while an srun client is alive. Run this script
+# under tmux on the login node and the tmux session owns that client.
+#
+# The relays carry no authorization of their own. Anyone on the cluster network can
+# already reach a login-node port, exactly as with the llm gateway on login009:4000;
+# the gates are Agor's own login and (for the public hostname) Cloudflare Access.
+#
+# usage:
+#   agor-relay.sh                 # run the supervisor in the foreground (use tmux)
+#   agor-relay.sh --status        # print the discovered lease/node/port, no changes
+#   agor-relay.sh --health        # exit 0 only if the public-facing hop answers /readyz
+set -euo pipefail
+
+LEASE_JOB_NAME="${AGOR_LEASE_JOB_NAME:-agor-cpu-supervisor-daemon}"
+LOGIN_PORT="${AGOR_LOGIN_PORT:-28914}"
+NODE_PORT="${AGOR_NODE_PORT:-28915}"
+REFRESH_SECONDS="${AGOR_RELAY_REFRESH_SECONDS:-60}"
+LOGIN_HOST="$(hostname -s)"
+RELAY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tcp-relay.mjs"
+NODE_BIN="${AGOR_NODE_BIN:-$(command -v node || true)}"
+
+[[ -r "$RELAY" ]] || { echo "relay script missing: $RELAY" >&2; exit 1; }
+[[ -n "$NODE_BIN" ]] || { echo "no node on PATH; set AGOR_NODE_BIN" >&2; exit 1; }
+
+# ---- discovery: the live lease, its node, and the daemon port it actually listens on.
+# Every value is measured here and now; nothing is remembered between iterations.
+discover() {
+  local row jid node workdir receipt port
+  # Newest RUNNING lease with the daemon job name wins; a migration always lands on a
+  # newer job id.
+  row="$(squeue -h -u "$USER" -o '%i %T %N %j' \
+         | awk -v n="$LEASE_JOB_NAME" '$4 == n && $2 == "RUNNING" {print $1, $3}' \
+         | sort -rn | head -1)"
+  [[ -n "$row" ]] || { echo "NO_RUNNING_LEASE name=$LEASE_JOB_NAME" >&2; return 1; }
+  read -r jid node <<<"$row"
+  workdir="$(scontrol show job "$jid" | tr ' ' '\n' | sed -n 's/^WorkDir=//p' | head -1)"
+  [[ -n "$workdir" ]] || { echo "NO_WORKDIR job=$jid" >&2; return 1; }
+  receipt="$workdir/native-root-$jid/native-receipt.json"
+  [[ -r "$receipt" ]] || { echo "NO_RECEIPT $receipt" >&2; return 1; }
+  port="$(jq -r '.port // empty' "$receipt")"
+  [[ "$port" =~ ^[0-9]+$ ]] || { echo "NO_PORT_IN_RECEIPT $receipt" >&2; return 1; }
+  # The receipt must describe THIS lease, or it is a leftover from a dead one.
+  local rjob rnode
+  rjob="$(jq -r '.cpu_lease.job_id // empty' "$receipt")"
+  rnode="$(jq -r '.cpu_lease.node // empty' "$receipt")"
+  [[ "$rjob" == "$jid" && "$rnode" == "$node" ]] \
+    || { echo "STALE_RECEIPT receipt=$rjob/$rnode squeue=$jid/$node" >&2; return 1; }
+  printf '%s %s %s\n' "$jid" "$node" "$port"
+}
+
+case "${1:-}" in
+  --status)
+    read -r jid node port < <(discover)
+    echo "lease=$jid node=$node daemon_port=$port"
+    echo "node relay:  $node:$NODE_PORT -> 127.0.0.1:$port"
+    echo "login relay: $LOGIN_HOST:$LOGIN_PORT -> $node:$NODE_PORT"
+    exit 0 ;;
+  --health)
+    # The only claim worth making: the public-facing hop answers the daemon's own
+    # readiness endpoint. A transport error is a failure, never a benign default.
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            "http://$LOGIN_HOST:$LOGIN_PORT/readyz")" || code=000
+    echo "GET http://$LOGIN_HOST:$LOGIN_PORT/readyz -> $code"
+    [[ "$code" == 200 ]] || exit 1
+    exit 0 ;;
+  '' ) : ;;
+  * ) echo "usage: agor-relay.sh [--status|--health]" >&2; exit 2 ;;
+esac
+
+node_pid=""; login_pid=""; current=""
+
+stop_relays() {
+  # Kill by the PIDs we started, never by pattern: a pattern scan on this node would
+  # match this script's own argv.
+  for pid in $node_pid $login_pid; do
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  done
+  for pid in $node_pid $login_pid; do
+    [[ -n "$pid" ]] || continue
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  done
+  node_pid=""; login_pid=""
+}
+trap 'stop_relays; exit 0' TERM INT
+
+while true; do
+  if want="$(discover)"; then
+    if [[ "$want" != "$current" ]]; then
+      echo "[$(date -Iseconds)] target changed: '${current:-<none>}' -> '$want'; restarting relays"
+      stop_relays
+      read -r jid node port <<<"$want"
+      srun --jobid="$jid" --nodelist="$node" --overlap --exact -N1 -n1 \
+        "$NODE_BIN" "$RELAY" "$node" "$NODE_PORT" 127.0.0.1 "$port" &
+      node_pid=$!
+      sleep 5
+      "$NODE_BIN" "$RELAY" "$LOGIN_HOST" "$LOGIN_PORT" "$node" "$NODE_PORT" &
+      login_pid=$!
+      current="$want"
+      echo "[$(date -Iseconds)] node_relay_pid=$node_pid login_relay_pid=$login_pid target=$want"
+    else
+      # A dead relay is a changed world even when the lease did not move.
+      for pid in $node_pid $login_pid; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          echo "[$(date -Iseconds)] relay pid $pid is gone; forcing a rebuild" >&2
+          stop_relays; current=""
+          break
+        fi
+      done
+    fi
+  else
+    echo "[$(date -Iseconds)] discovery failed; relays stopped until a lease is back" >&2
+    stop_relays; current=""
+  fi
+  sleep "$REFRESH_SECONDS"
+done

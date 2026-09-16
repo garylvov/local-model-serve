@@ -354,6 +354,11 @@ cmd_up() {
     say "loading $m ($(ini_get "$m" hf-repo) on $(ini_get "$m" device))"
     api POST /models/load "{\"model\":\"$m\"}" | jq -c .
     wait_status "$m" loaded "${LLM_LOAD_TIMEOUT:-1800}"
+    # Fully GPU-offloaded models never read their files again: drop the now-redundant page-cache
+    # copy. Models with CPU-side weights (n-cpu-moe / cpu-moe) keep it, since they page from it.
+    if [[ -z "${LLM_KEEP_CACHE:-}" && -z "$(ini_get "$m" n-cpu-moe)$(ini_get "$m" cpu-moe)" ]]; then
+      python3 "$ROOT/scripts/weights_cache.py" evict "$(ini_get "$m" hf-repo)" || true
+    fi
   done
 }
 
