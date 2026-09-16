@@ -185,14 +185,15 @@ not enabled.
 <details>
 <summary><b>Loading very large models faster</b></summary>
 
-llama.cpp reads weights on a single thread, which is slow on network filesystems. Fill the page
-cache in parallel first, then load with mmap:
+llama.cpp reads weights on a single thread, which is slow on network filesystems, and it never
+releases an unloaded model's pages from the page cache. `bin/llm` handles both:
 
-```bash
-scripts/prewarm.sh models/.../Model-00001-of-00019.gguf 19
-bin/llm up kimi-k3
-```
+- `llm up <model>` reads a large model's files in parallel first (over `LLM_PREWARM_MIN_GIB`,
+  default 32), so the loader finds them in RAM. `LLM_NO_PREWARM=1` skips this.
+- `llm down <model>` evicts its files from the page cache, so the next model has room.
+  `LLM_KEEP_CACHE=1` keeps them for a faster reload.
 
-Measured for an 802 GiB model over NFS: 47+ min cold, versus 4 min pre-warm + 1 min load.
+Manually: `python3 scripts/weights_cache.py warm|evict <hf-repo:quant>`.
+Measured for an 802 GiB model over NFS: 47+ min cold, 4 min warm-up + 1 min load.
 
 </details>

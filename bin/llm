@@ -348,6 +348,9 @@ cmd_up() {
   local m
   for arg in "$@"; do
     m="$(resolve "$arg")"
+    # Large models: fill the page cache in parallel first; llama.cpp's own reader is one thread.
+    [[ -n "${LLM_NO_PREWARM:-}" ]] || python3 "$ROOT/scripts/weights_cache.py" warm "$(ini_get "$m" hf-repo)" \
+      --min-gib "${LLM_PREWARM_MIN_GIB:-32}" || true
     say "loading $m ($(ini_get "$m" hf-repo) on $(ini_get "$m" device))"
     api POST /models/load "{\"model\":\"$m\"}" | jq -c .
     wait_status "$m" loaded "${LLM_LOAD_TIMEOUT:-1800}"
@@ -361,6 +364,11 @@ cmd_down() {
     m="$(resolve "$arg")"
     api POST /models/unload "{\"model\":\"$m\"}" | jq -c .
     wait_status "$m" unloaded 120
+    # Release its weights from the page cache too, unless another loaded copy still uses them.
+    local repo; repo="$(ini_get "$m" hf-repo)"
+    if [[ -z "${LLM_KEEP_CACHE:-}" ]] && ! loaded | while read -r o; do [[ "$(ini_get "$o" hf-repo)" == "$repo" ]] && echo x; done | grep -q x; then
+      python3 "$ROOT/scripts/weights_cache.py" evict "$repo" || true
+    fi
   done
 }
 
