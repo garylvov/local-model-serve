@@ -221,8 +221,7 @@ async def poll(url: str) -> None:
         r.raise_for_status()
         data = r.json().get("data", [])
         p["models"] = {m["id"]: m.get("status", {}).get("value", "loaded") for m in data}
-        p["detail"] = {m["id"]: await model_detail(url, p, m) for m in data
-                       if m.get("status", {}).get("value") in ("loaded", "loading", "sleeping")}
+        p["detail"] = {m["id"]: await model_detail(url, p, m) for m in data}
         p["ok"] = True
     except (httpx.HTTPError, ValueError) as e:
         p["ok"] = False
@@ -234,14 +233,30 @@ def _arg(args: list, flag: str):
 
 
 async def model_detail(url: str, p: dict, m: dict) -> dict:
-    """GPU placement, speed, load and context use for one model on a peer. Only numbers and GPU
-    indices are kept: never router args verbatim (they contain file paths and key-file locations)."""
+    """GPU placement, speed, load/download progress and context use for one model on a peer. Only
+    numbers and GPU indices are kept: never router args verbatim (file paths, key-file locations)."""
     st = m.get("status", {})
     args = [str(a) for a in st.get("args", [])]
     dev = _arg(args, "--device") or ""
     gpus = [int(d[4:]) for d in dev.split(",") if d.startswith("CUDA") and d[4:].isdigit()]
-    out = {"state": st.get("value"), "gpus": gpus, "parallel": int(_arg(args, "--parallel") or 0) or None}
-    if st.get("value") != "loaded":
+    state = st.get("value")
+    out = {"state": state, "gpus": gpus, "parallel": int(_arg(args, "--parallel") or 0) or None,
+           "failed": bool(st.get("failed")), "exit_code": st.get("exit_code")}
+    if state == "loading" or state == "downloading":
+        since = p.setdefault("_since", {}).setdefault(m["id"], time.time())
+        out["since_s"] = round(time.time() - since)
+    else:
+        p.setdefault("_since", {}).pop(m["id"], None)
+    if state == "downloading" and isinstance(st.get("progress"), dict):
+        done = total = 0
+        for f in st["progress"].values():
+            done += f.get("done", 0) or 0
+            total += f.get("total", 0) or 0
+        out["download"] = {"done_gib": round(done / 1024**3, 2), "total_gib": round(total / 1024**3, 2),
+                           "pct": round(100 * done / total, 1) if total else None}
+    if state == "loading" and isinstance(st.get("progress"), dict):
+        out["load_progress"] = st["progress"]  # {stages, current, value} - already just numbers/labels
+    if state != "loaded":
         return out
     try:
         u, h, ext = await target(url, "/metrics")
@@ -348,13 +363,15 @@ async def machines(req: Request):
     now = time.time()
     out = []
     for u, p in sorted(peers.items()):
-        models_by_id = {m["id"] if isinstance(m, dict) else m: s for m, s in p["models"].items()} if False else p["models"]
         merged = {}
         for name, cfg in (p.get("preset") or {}).items():
             merged[name] = {**cfg, "state": p["models"].get(name, "unloaded"), **p.get("detail", {}).get(name, {})}
         for name, state in p["models"].items():  # cached-but-not-in-preset models still show up
             if name not in merged:
                 merged[name] = {"state": state, **p.get("detail", {}).get(name, {})}
+        for x in merged.values():
+            if x.get("downloaded") is False:   # size for the "Download (N GiB)" button, from the catalog
+                x["catalog_gib"] = catalog_quant_gib(x.get("hf_repo"), x.get("quant"))
         out.append({"host": p.get("host", u), "ok": p["ok"], "stale": now - p["seen"] > 45 or not p["ok"],
                     "age_s": round(now - p["seen"]), "gpus": p.get("gpus", []),
                     "disk_free_gib": p.get("disk_free_gib"), "models": merged,
@@ -380,15 +397,26 @@ async def model_action(req: Request):
     url, p = peer_by_host(host)
     if not p:
         return err(404, f"unknown machine {host!r}")
+    body = {}
+    try:
+        body = json.loads(await req.body() or b"{}")
+    except ValueError:
+        pass
     if action == "unload":
         inflight = (p.get("detail", {}).get(model) or {}).get("inflight") or 0
-        body = {}
-        try:
-            body = json.loads(await req.body() or b"{}")
-        except ValueError:
-            pass
         if inflight and not body.get("confirm"):
             return err(409, f"{inflight} request(s) in flight for {model}; pass confirm:true to unload anyway")
+    if action == "load":
+        # Never let "load" silently fall through to the router's own auto-download (that's what
+        # turned one click on an undownloaded model into an unannounced 120 GiB pull that evicted
+        # every other loaded model - see _out.md, 2026-09-16). Downloading is its own endpoint
+        # with its own explicit confirmation; load refuses outright if the weights aren't local.
+        cfg = (p.get("preset") or {}).get(model) or (p.get("detail") or {}).get(model) or {}
+        if cfg.get("downloaded") is False:
+            return err(409, f"{model} is not downloaded on {host}; use the Download button instead")
+        others = [n for n, s in (p.get("models") or {}).items() if s == "loaded" and n != model]
+        if others and not body.get("confirm"):
+            return err(409, f"other model(s) currently loaded on {host}: {others}; pass confirm:true to load anyway")
     try:
         r = await peer_call(p, url, "POST", f"/models/{action}", json_body={"model": model})
     except httpx.HTTPError as e:
@@ -416,11 +444,19 @@ async def model_download(req: Request):
     repo, quant, custom = str(body.get("repo", "")).strip(), body.get("quant"), bool(body.get("custom_repo"))
     if not repo or "/" not in repo:
         return err(400, "repo required, e.g. org/name")
+    if not body.get("confirm"):
+        return err(409, "downloading is destructive to disk/bandwidth; pass confirm:true")
     known = repo in catalog_repos()
     if not known and not custom:
         return err(400, f"{repo!r} is not in catalog/models.yaml; pass custom_repo:true to override")
     size_gib = catalog_quant_gib(repo, quant)
     free = p.get("disk_free_gib")
+    # Fail CLOSED, not open: a catalog repo with a quant tag we can't size (typo, or a quant this
+    # catalog entry doesn't list) must not silently skip the disk check - only an explicit
+    # custom_repo:true (an acknowledged unknown-size risk) may proceed without a size shown.
+    if size_gib is None and not custom:
+        return err(400, f"can't determine the download size for {repo!r} quant {quant!r} from "
+                        "catalog/models.yaml; check the quant tag, or pass custom_repo:true to override")
     if size_gib is not None and free is not None and size_gib * 1.05 > free:
         return err(400, f"needs ~{size_gib:.1f} GiB, only {free:.1f} GiB free on {host}")
     hf_repo = f"{repo}:{quant}" if quant else repo
@@ -433,25 +469,11 @@ async def model_download(req: Request):
 
 
 async def model_delete(req: Request):
-    if (g := await guard(req)) is not None:
-        return g
-    host, model = req.path_params["host"], req.path_params["model"]
-    url, p = peer_by_host(host)
-    if not p:
-        return err(404, f"unknown machine {host!r}")
-    try:
-        body = json.loads(await req.body() or b"{}")
-    except ValueError:
-        body = {}
-    if not body.get("confirm"):
-        return err(409, "delete is destructive; pass confirm:true")
-    try:
-        r = await peer_call(p, url, "DELETE", "/models", params={"model": model})
-    except httpx.HTTPError as e:
-        return err(502, f"peer unreachable: {type(e).__name__}")
-    audit(req, "model_delete", host=host, model=model, status=r.status_code)
-    await poll(url)
-    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
+    """Deleting 100+ GiB of weights is a shell-only operation (operator decision, 2026-09-16):
+    always refused, whether the caller has the login cookie or the bearer API key. There is
+    deliberately no code path here that reaches the router's DELETE /models."""
+    audit(req, "model_delete_refused", host=req.path_params.get("host"), model=req.path_params.get("model"))
+    return err(403, "deleting model weights is disabled in the Models tab; use a shell on the machine")
 
 
 async def model_sse(req: Request):
@@ -661,8 +683,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
             p["inflight"] -= 1
         # aread() already undoes Content-Encoding (llama.cpp ships the shell pre-gzipped)
         html = body.decode("utf-8", "replace")
-        bar = TABBAR % (ACTIVE, "", "")
-        html = html.replace("</body>", bar + "</body>", 1) if "</body>" in html else html + bar
+        html = html.replace("</body>", CHAT_LAUNCHER + "</body>", 1) if "</body>" in html else html + CHAT_LAUNCHER
         out = {k: v for k, v in out.items() if k.lower() not in ("content-encoding", "etag")}
         out["cache-control"] = "no-store"
         return Response(html, status_code=200, headers=out, media_type="text/html; charset=utf-8")
@@ -733,6 +754,28 @@ TABBAR = ("<nav id=llm-tabs style=\"position:fixed;top:6px;left:50%%;transform:t
           "</nav>")
 ACTIVE = "background:rgba(127,127,127,.35)"
 
+# The llama.cpp WebUI has its own header/left icon rail that a centered top bar collides with
+# (worse once a conversation is open - see run/shots/chat-1440.png). This is a tiny collapsed
+# launcher pinned to the one corner that chrome doesn't use (top-right, clear of the left icon
+# rail, the header and the message input at every width tested), expanding via native <details>
+# (no JS needed, so it can't break if the WebUI's own bundle changes). /status and /models-ui have
+# no WebUI chrome to collide with, so they keep the full TABBAR unchanged.
+CHAT_LAUNCHER = (
+    "<details id=llm-launcher style=\"position:fixed;top:8px;right:8px;z-index:2147483647;"
+    "font:600 12px system-ui,sans-serif\">"
+    "<summary style=\"list-style:none;width:30px;height:30px;border-radius:50%;display:flex;"
+    "align-items:center;justify-content:center;cursor:pointer;background:rgba(127,127,127,.28);"
+    "backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:inherit\" "
+    "title=\"Hardware / Models\">&#8942;</summary>"
+    "<div style=\"position:absolute;top:36px;right:0;display:flex;flex-direction:column;gap:2px;"
+    "padding:4px;border-radius:10px;min-width:104px;background:rgba(127,127,127,.28);"
+    "backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)\">"
+    "<a href=/ style=\"padding:5px 10px;border-radius:6px;color:inherit;text-decoration:none;"
+    "background:rgba(127,127,127,.35)\">Chat</a>"
+    "<a href=/status style=\"padding:5px 10px;border-radius:6px;color:inherit;text-decoration:none\">Hardware</a>"
+    "<a href=/models-ui style=\"padding:5px 10px;border-radius:6px;color:inherit;text-decoration:none\">Models</a>"
+    "</div></details>")
+
 HARDWARE_HTML = """<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Hardware - llm.garylvov.com</title>
 <meta name=color-scheme content="light dark"><style>
@@ -753,13 +796,15 @@ color:var(--mute)}.sub{margin:2px 0 10px;font-size:12px}
 .gpu{display:grid;grid-template-columns:2em minmax(10em,16em) minmax(0,1fr) minmax(0,1.4fr) 7.5em;gap:6px 16px;
 align-items:center;padding:9px 0;border-top:1px solid var(--line)}.gi{font-weight:650;color:var(--mute)}
 .gn{font-size:13px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.gn .tag{display:block;overflow:hidden;text-overflow:ellipsis}.gt{font-size:13px;text-align:right;white-space:nowrap}
+.gn .tag{overflow:visible;white-space:normal}.gt{font-size:13px;text-align:right;white-space:nowrap}
 .bars{display:contents}.bar{position:relative;height:22px;border-radius:6px;background:var(--track);overflow:hidden}
 .bar i{position:absolute;inset:0 auto 0 0;background:var(--acc);transition:width .4s}.bar b{position:relative;
 font:600 12px/22px system-ui;padding-left:8px;white-space:nowrap}.bar.u i{background:var(--ok)}.bar.hi i{background:var(--warn)}
 @media (max-width:760px){.gpu{grid-template-columns:2em 1fr auto}.gt{grid-column:3;grid-row:1}
 .bars{display:grid;grid-column:1/-1;gap:5px}}
-.bar.full i{background:var(--hot)}.tag{font-size:11px;color:var(--mute)}
+.bar.full i{background:var(--hot)}.tag{font-size:11px;color:var(--mute);display:flex;gap:8px;flex-wrap:wrap;overflow:visible;white-space:normal}
+.mdot{display:inline-block;width:8px;height:8px;border-radius:50%%;margin-right:5px;flex:none}
+.mtag{display:inline-flex;align-items:center;white-space:nowrap}
 .model{margin-top:10px;padding:8px 10px;border-radius:8px;background:var(--track)}
 .mname{font-weight:650}.kv{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:12px;color:var(--mute)}
 .kv b{color:var(--fg);font-weight:600}.empty{padding:30px;text-align:center}
@@ -770,6 +815,18 @@ const pct=(a,b)=>b?Math.max(0,Math.min(100,100*a/b)):0;
 const cls=p=>p>=90?" full":p>=70?" hi":"";
 function bar(p,label,extra){return `<div class="bar${extra}${cls(p)}"><i style="width:${p.toFixed(1)}%%"></i><b>${esc(label)}</b></div>`}
 function ago(s){return s<60?s+"s":Math.floor(s/60)+"m "+(s%%60)+"s"}
+// Stable per-model colour (hash the name -> hue; fixed sat/light reads fine on both the light
+// and dark --card backgrounds). Used as a dot + left border only, never as the util/VRAM bar
+// fill (that stays green/amber/red), and always alongside the text label, never instead of it.
+// A raw hash%%360 clusters badly (two names can land 10-20 degrees apart and read as the same
+// colour - measured on this page: "qwen3.8-27b" and "qwen3.8-flash-next" both landed ~310-330).
+// Pick from a small hand-spaced palette instead so any two different models are always clearly
+// distinct; index (not hue) is hashed, so collisions only happen past PALETTE.length distinct
+// models on one machine, at which point the text label is still the accessible fallback.
+const PALETTE=[350,205,140,40,275,95,320,165,10,240];
+function hashIdx(s){let h=0; for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0; return h%%PALETTE.length}
+function modelColor(name,copy){const l=copy?38:50; return `hsl(${PALETTE[hashIdx(name)]} 68%% ${l}%%)`}
+function dot(name,copy){return `<i class=mdot style="background:${modelColor(name,copy)}"></i>`}
 function render(d){
   document.getElementById("ts").textContent="updated "+d.ts;
   const g=document.getElementById("grid");
@@ -778,12 +835,13 @@ function render(d){
     const det=p.model_detail||{}, gm={};
     for(const[m,x] of Object.entries(det)) for(const i of x.gpus||[]) (gm[i]=gm[i]||[]).push(m);
     const gpus=(p.gpus||[]).map(x=>{const u=+x.util||0, mp=pct(+x.mem_used,+x.mem_total);
-      return `<div class=gpu><span class=gi>${esc(x.index)}</span><span class=gn>${esc(x.name)}<span class=tag>${gm[x.index]?esc(gm[x.index].join(", ")):"idle"}</span></span>
+      const tags=(gm[x.index]||[]).map(m=>`<span class=mtag>${dot(m)}${esc(m)}</span>`).join(" ");
+      return `<div class=gpu><span class=gi>${esc(x.index)}</span><span class=gn>${esc(x.name)}<span class=tag>${tags||"idle"}</span></span>
       <div class=bars>${bar(u,`util ${u}%%`," u")}${bar(mp,`VRAM ${(x.mem_used/1024).toFixed(1)} / ${(x.mem_total/1024).toFixed(1)} GiB`,"")}</div>
       <span class=gt>${esc(x.temp)} °C · ${x.power==null?"-":Math.round(x.power)} W</span></div>`}).join("");
     const models=Object.entries(det).map(([m,x])=>{
       const ctx=x.ctx_slot?`${x.ctx_peak.toLocaleString()} / ${x.ctx_slot.toLocaleString()} (${pct(x.ctx_peak,x.ctx_slot).toFixed(0)}%%)`:"-";
-      return `<div class=model><span class=mname>${esc(m)}</span> <span class=pill>${esc(x.state)}</span>
+      return `<div class=model style="border-left:3px solid ${modelColor(m)}"><span class=mname>${dot(m)}${esc(m)}</span> <span class=pill>${esc(x.state)}</span>
       <div class=kv><span>GPUs <b>${(x.gpus||[]).join(", ")||"-"}</b></span>
       <span>last 60 s <b>${x.tok_s==null?"-":x.tok_s} tok/s</b></span><span>decode <b>${x.avg_tok_s??"-"} tok/s</b></span>
       <span>in flight <b>${x.inflight??"-"}</b>${x.queued?` (+${x.queued} queued)`:""}</span>
@@ -822,6 +880,7 @@ h1{font-size:18px;margin:0}.mute{color:var(--mute)}.grid{display:grid;gap:18px;g
 .card.stale{opacity:.45;filter:grayscale(1)}.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .host{font-weight:650;font-size:16px}.pill{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);
 color:var(--mute)}.pill.loaded{color:var(--ok);border-color:var(--ok)}.pill.loading,.pill.downloading{color:var(--warn);border-color:var(--warn)}
+.pill.err{color:var(--hot);border-color:var(--hot)}.dlprog{margin-top:6px;display:grid;gap:3px}
 .sub{margin:2px 0 10px;font-size:12px}
 .model{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--track)}
 .mrow{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
@@ -845,7 +904,7 @@ border:1px solid var(--line);border-radius:5px;padding:2px 6px;cursor:pointer;ma
 progress{width:100%%;height:8px}
 .empty{padding:30px;text-align:center}
 </style>%(tabs)s<main><header><h1>Models</h1><span class=mute id=ts>loading...</span></header>
-<div class=grid id=grid></div></main>
+<div class=grid id=grid><div class="card empty mute">Loading machines...</div></div></main>
 <script>
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let DATA={machines:[]};
@@ -856,23 +915,77 @@ async function api(path,opts){
   return body;
 }
 function stateClass(s){return s==="loaded"?"loaded":(s==="loading"||s==="downloading")?"loading":""}
-async function doLoad(host,model){
-  const btn=event.target; btn.disabled=true;
-  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/load`,{method:"POST"}); await tick()}
-  catch(e){alert("load failed: "+e.message)} finally{btn.disabled=false}
+const rateHist={};  // "host/model" -> [(t, done_gib)] for a client-side rate/ETA estimate between polls
+function downloadBar(dl){
+  if(!dl) return "";
+  const pct=dl.pct??0, key=JSON.stringify(dl);
+  const h=(rateHist[key]=rateHist[key]||[]); const now=Date.now();
+  h.push([now,dl.done_gib]); while(h.length>1 && now-h[0][0]>30000) h.shift();
+  let rateTxt="", etaTxt="";
+  if(h.length>1){
+    const dt=(h[h.length-1][0]-h[0][0])/1000, dg=h[h.length-1][1]-h[0][1];
+    if(dt>0 && dg>0){
+      const rate=dg/dt; rateTxt=`${rate.toFixed(2)} GiB/s`;
+      if(dl.total_gib!=null){const remain=(dl.total_gib-dl.done_gib)/rate; etaTxt=`ETA ${Math.max(0,Math.round(remain/60))}m`}
+    }
+  }
+  return `<div class=dlprog><progress value="${pct}" max=100></progress>
+    <span class=mute>${dl.done_gib.toFixed(1)} / ${dl.total_gib!=null?dl.total_gib.toFixed(1):"?"} GiB (${pct}%%)${rateTxt?" - "+rateTxt:""}${etaTxt?" - "+etaTxt:""}</span></div>`;
+}
+// Speculative decoding (MTP draft model) is a preset field, but turning it on for real needs the
+// qwen-mtp llama.cpp build AND the MTP draft weights downloaded and pointed at with model-draft -
+// neither is wired to a one-click mutation yet, so this is shown disabled with why (per the brief).
+function specReason(x){
+  if(x.spec_type) return null;
+  if(x.build!=="qwen-mtp") return `needs build: qwen-mtp (catalog/builds.yaml) - this preset uses "${esc(x.build||"master")}"`;
+  if(!x.no_mmproj) return "vision models can't share a process with a draft model (llama.cpp #27408)";
+  return "MTP draft weights not wired to a preset edit yet - download them and set model-draft by hand";
+}
+function specBadge(x){
+  if(x.spec_type) return `<span class="pill loaded">spec: ${esc(x.spec_type)}</span>`;
+  return "";
+}
+function specToggle(x){
+  const reason=specReason(x);
+  const label="speculative decoding (MTP draft)";
+  if(x.spec_type) return `<label style="display:flex;align-items:center;gap:4px;border:none;padding:0"><input type=checkbox checked disabled> ${label}: on</label>`;
+  return `<label title="${esc(reason||"")}" style="display:flex;align-items:center;gap:4px;border:none;padding:0;opacity:.6">
+    <input type=checkbox disabled> ${label}${reason?` <span class=mute>(${esc(reason)})</span>`:""}</label>`;
+}
+const busy=new Set();  // "host/model" currently mid-action, client-side, so every button on that
+                        // row disables immediately rather than waiting for the next 4s poll
+function rowBusy(host,model){return busy.has(host+"/"+model)}
+async function doLoad(host,model,otherLoaded){
+  if(otherLoaded.length && !confirm(
+    `Loading ${model} on ${host} may require freeing GPU(s) currently used by: ${otherLoaded.join(", ")}.\n`+
+    `The router has been observed to unload unrelated running models to make room for a new one - `+
+    `this is NOT guaranteed safe. Continue?`))return;
+  busy.add(host+"/"+model); render(DATA);
+  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/load`,
+    {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:otherLoaded.length>0})}); await tick()}
+  catch(e){alert("load failed: "+e.message)} finally{busy.delete(host+"/"+model); render(DATA)}
 }
 async function doUnload(host,model,inflight){
   if(inflight>0 && !confirm(`${model} has ${inflight} request(s) in flight on ${host}. Unload anyway?`))return;
-  const btn=event.target; btn.disabled=true;
+  busy.add(host+"/"+model); render(DATA);
   try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/unload`,
     {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:inflight>0})}); await tick()}
-  catch(e){alert("unload failed: "+e.message)} finally{btn.disabled=false}
+  catch(e){alert("unload failed: "+e.message)} finally{busy.delete(host+"/"+model); render(DATA)}
 }
-async function doDelete(host,model){
-  if(!confirm(`Permanently delete the downloaded weights for ${model} on ${host}?`))return;
-  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}`,
-    {method:"DELETE",headers:{"content-type":"application/json"},body:JSON.stringify({confirm:true})}); await tick()}
-  catch(e){alert("delete failed: "+e.message)}
+async function doDownload(host,model,repo,quant,gib,free){
+  const freeTxt=free!=null?` (${free.toFixed(1)} GiB free on ${host})`:"";
+  if(!confirm(`Download ${repo}${quant?":"+quant:""} for ${model}?\nSize: ~${gib!=null?gib.toFixed(1)+" GiB":"unknown"}${freeTxt}\n`+
+    `This can take a while and uses disk + network on ${host}.`))return;
+  busy.add(host+"/"+model); render(DATA);
+  try{await api(`/machines/${encodeURIComponent(host)}/models`,{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({repo, quant: quant||undefined, confirm:true})}); await tick()}
+  catch(e){alert("download failed: "+e.message)} finally{busy.delete(host+"/"+model); render(DATA)}
+}
+async function cancelDownload(host,model){
+  if(!confirm(`Cancel the download of ${model} on ${host}?`))return;
+  try{await api(`/machines/${encodeURIComponent(host)}/models/${encodeURIComponent(model)}/unload`,{method:"POST",
+    headers:{"content-type":"application/json"},body:JSON.stringify({confirm:true})}); await tick()}
+  catch(e){alert("cancel failed: "+e.message)}
 }
 function toggleForm(id){const f=document.getElementById(id);f.classList.toggle("open")}
 async function savePlacement(host,model,formId){
@@ -892,9 +1005,11 @@ async function startDownload(host,formId){
   const repo=f.querySelector(".dl-repo").value.trim(), quant=f.querySelector(".dl-quant").value.trim();
   const custom=f.querySelector(".dl-custom").checked;
   const errEl=f.querySelector(".dl-err"); errEl.textContent="";
+  if(!confirm(`Download ${repo}${quant?":"+quant:""} onto ${host}?\nSize is unknown until the router validates it - `+
+    `check it fits before confirming. This uses disk + network on ${host}.`))return;
   try{
     await api(`/machines/${encodeURIComponent(host)}/models`,{method:"POST",headers:{"content-type":"application/json"},
-      body:JSON.stringify({repo, quant: quant||undefined, custom_repo: custom})});
+      body:JSON.stringify({repo, quant: quant||undefined, custom_repo: custom, confirm:true})});
     errEl.className="warn"; errEl.textContent="download started";
     await tick();
   }catch(e){errEl.className="err"; errEl.textContent=e.message}
@@ -906,29 +1021,52 @@ function render(d){
   if(!d.machines.length){g.innerHTML='<div class="card empty mute">No machines are heartbeating.</div>';return}
   g.innerHTML=d.machines.map((m,mi)=>{
     const gpuList=(m.gpus||[]).map(x=>x.index);
+    const loadedNames=Object.entries(m.models||{}).filter(([,x])=>x.state==="loaded").map(([n])=>n);
     const models=Object.entries(m.models||{}).map(([name,x],i)=>{
       const fid=`f-${mi}-${i}`;
       const gpus=x.gpus||[];
       const gpuCbs=gpuList.map(gi=>`<label><input type=checkbox class=gpu-cb value="${gi}" ${gpus.includes(gi)?"checked":""}>${gi}</label>`).join("");
-      const loaded=x.state==="loaded";
+      const loaded=x.state==="loaded", downloading=x.state==="downloading", loading=x.state==="loading";
+      const notDownloaded=x.downloaded===false;
+      const busyRow=rowBusy(m.host,name)||downloading||loading;
+      let stateLabel=x.state||"unloaded";
+      if(notDownloaded && !downloading) stateLabel="not downloaded";
+      if(x.failed) stateLabel="failed";
+      let actionBtn;
+      if(loaded){
+        actionBtn=`<button class=danger ${busyRow?"disabled":""} onclick="doUnload('${esc(m.host)}','${esc(name)}',${x.inflight||0})">Unload</button>`;
+      }else if(downloading){
+        const dl=x.download||{}; actionBtn=`<button class=danger onclick="cancelDownload('${esc(m.host)}','${esc(name)}')">Cancel download</button>`;
+      }else if(loading){
+        actionBtn=`<button disabled>Loading... ${x.since_s!=null?x.since_s+"s":""}</button>`;
+      }else if(notDownloaded){
+        const gib=x.catalog_gib; const free=m.disk_free_gib;
+        actionBtn=`<button ${busyRow?"disabled":""} onclick="doDownload('${esc(m.host)}','${esc(name)}','${esc(x.hf_repo||"")}','${esc(x.quant||"")}',${gib==null?"null":gib},${free==null?"null":free})">Download${gib!=null?` (${gib.toFixed(1)} GiB)`:""}</button>`;
+      }else{
+        actionBtn=`<button ${busyRow?"disabled":""} onclick="doLoad('${esc(m.host)}','${esc(name)}',${JSON.stringify(loadedNames.filter(n=>n!==name))})">Load</button>`;
+      }
       return `<div class=model>
-        <div class=mrow><span class=mname>${esc(name)}</span><span class="pill ${stateClass(x.state)}">${esc(x.state||"unloaded")}</span>
-        ${loaded?`<button class=danger onclick="doUnload('${esc(m.host)}','${esc(name)}',${x.inflight||0})">Unload</button>`
-                :`<button onclick="doLoad('${esc(m.host)}','${esc(name)}')">Load</button>`}
-        <button class=danger onclick="doDelete('${esc(m.host)}','${esc(name)}')">Delete weights</button>
-        <button class=edit onclick="toggleForm('${fid}')">Edit placement</button></div>
+        <div class=mrow><span class=mname>${esc(name)}</span><span class="pill ${stateClass(x.state)}${x.failed?" err":""}">${esc(stateLabel)}</span>
+        ${actionBtn}
+        <button class=edit ${busyRow?"disabled":""} onclick="toggleForm('${fid}')">Edit placement</button></div>
+        ${downloading?downloadBar(x.download):""}
+        ${x.failed?`<div class=err>load failed${x.exit_code!=null?` (exit code ${x.exit_code})`:""} - check this machine's router log</div>`:""}
         <div class=kv><span>GPUs <b>${gpus.join(", ")||"-"}</b></span>
         ${x.quant?`<span>quant <b>${esc(x.quant)}</b></span>`:""}
         ${x.ctx_size||x.ctx_slot?`<span>ctx <b>${(x.ctx_size||x.ctx_slot).toLocaleString()}</b></span>`:""}
         ${x.parallel?`<span>parallel <b>${x.parallel}</b></span>`:""}
         ${x.avg_tok_s?`<span>decode <b>${x.avg_tok_s} tok/s</b></span>`:""}
-        ${x.inflight!=null?`<span>in flight <b>${x.inflight}</b></span>`:""}</div>
+        ${x.inflight!=null?`<span>in flight <b>${x.inflight}</b></span>`:""}
+        ${x.build?`<span>build <b>${esc(x.build)}</b></span>`:""}
+        ${x.downloaded_gib!=null?`<span>on disk <b>${x.downloaded_gib.toFixed(1)} GiB</b></span>`:""}
+        ${specBadge(x)}</div>
         <div class=form id="${fid}">
           <div><label>GPUs</label><div class=gpus>${gpuCbs||"<span class=mute>no GPU data</span>"}</div></div>
           <div><label>ctx-size</label><input class=f-ctx type=number value="${x.ctx_size||x.ctx_slot||131072}"></div>
           <div><label>parallel</label><input class=f-par type=number value="${x.parallel||4}"></div>
           <div><label>mmproj</label><label style="display:flex;align-items:center;gap:4px;border:none;padding:0">
             <input class=f-mmproj type=checkbox ${x.no_mmproj?"":"checked"}> enabled</label></div>
+          <div>${specToggle(x)}</div>
           <div class=formrow><button onclick="savePlacement('${esc(m.host)}','${esc(name)}','${fid}')">Save (writes preset, applies on next heartbeat)</button>
           <span class="form-err mute"></span></div>
         </div>
