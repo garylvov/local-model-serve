@@ -4,7 +4,7 @@
 # Variants come from catalog/builds.yaml: `master` -> vendor/llama.cpp, others -> vendor/llama.cpp-<variant>.
 # Env overrides: LLAMA_REF (default master), CUDA_ARCHS (default: auto-detect via
 # nvidia-smi compute_cap, fallback 86), JOBS (default nproc).
-# On Oscar, load CUDA first:  module load cuda/12.9.0-cinr
+# On a module-based cluster, load CUDA first, e.g.:  module load cuda
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

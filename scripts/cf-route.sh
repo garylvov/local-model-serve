@@ -1,27 +1,34 @@
 #!/usr/bin/env bash
 # Add/update ONE ingress rule on the existing remotely-managed Cloudflare Tunnel:
-#   <hostname> -> <service>   (default llm.garylvov.com -> http://<gateway-host>:4000)
+#   <hostname> -> <service>   (default: the host of LLM_PUBLIC_URL -> http://<gateway-host>:4000)
 # preserving every other rule verbatim, plus the proxied DNS CNAME if missing.
 #
 # DEFAULT IS DRY-RUN: only GETs are made; prints the before/after ingress diff and
 # the DNS action. `--apply` performs the PUT (tunnel configuration) and POST (DNS).
 #
-# Usage: scripts/cf-route.sh [--hostname llm.garylvov.com] [--service http://gpu2260:4000]
-#                            [--tunnel-id ID] [--account-id ID] [--zone garylvov.com] [--apply]
-# Env:   CF_API_TOKEN_FILE (default ~/.config/slurm-dash/cloudflare-api-token)
+# Usage: scripts/cf-route.sh [--hostname llm.example.com] [--service http://gateway-host:4000]
+#                            [--tunnel-id ID] [--account-id ID] [--zone example.com] [--apply]
+# Config: CF_ZONE, CF_API_TOKEN_FILE, CF_ANCHOR_HOST, LLM_PUBLIC_URL (config.env or environment)
 #
 # The token is only ever fed to curl through a stdin config (-K -), never argv or output.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HOSTNAME_FQDN="llm.garylvov.com"
-ZONE_NAME="garylvov.com"
+# site settings (CF_ZONE, LLM_PUBLIC_URL, CF_API_TOKEN_FILE ...) from config.env; env vars win
+for cfg in "${LLM_SITE_CONFIG:-}" "$ROOT/config.env" "$HOME/.config/local-model-serve/config.env"; do
+  [[ -n "$cfg" && -r "$cfg" ]] || continue
+  while IFS='=' read -r k v; do [[ -n "${!k:-}" ]] || export "$k=${v/#\~/$HOME}"; done \
+    < <(grep -E '^[A-Z_][A-Z0-9_]*=' "$cfg" | sed -E 's/[[:space:]]+#.*$//')
+  break
+done
+HOSTNAME_FQDN="${LLM_PUBLIC_URL#*://}"; HOSTNAME_FQDN="${HOSTNAME_FQDN%%/*}"
+ZONE_NAME="${CF_ZONE:-}"
 SERVICE=""
 TUNNEL_ID="${CF_TUNNEL_ID:-}"
 ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
-ANCHOR_HOST="${CF_ANCHOR_HOST:-ccv.garylvov.com}"   # used to find the right tunnel
+ANCHOR_HOST="${CF_ANCHOR_HOST:-}"   # optional: an existing hostname on the tunnel to use, to find it
 APPLY=0
-TOKEN_FILE="${CF_API_TOKEN_FILE:-$HOME/.config/slurm-dash/cloudflare-api-token}"
+TOKEN_FILE="${CF_API_TOKEN_FILE:-$HOME/.config/local-model-serve/cloudflare-api-token}"
 API="https://api.cloudflare.com/client/v4"
 
 while [[ $# -gt 0 ]]; do

@@ -1,6 +1,6 @@
 """Drive the same loop the WebUI runs: GET /tools, chat with tools, execute tool_calls via POST /tools."""
 import json, os, sys, time, urllib.request
-BASE = sys.argv[1] if len(sys.argv) > 1 else "https://llm.garylvov.com"
+BASE = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LLM_BASE_URL", "http://127.0.0.1:4000")
 KEY = open(os.path.expanduser("~/.config/local-model-serve/api-key")).read().strip()
 H = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json", "User-Agent": "llm-agent-loop-test/1.0"}
 def req(method, path, body=None):

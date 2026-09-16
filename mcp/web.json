@@ -2,8 +2,15 @@
   "mcpServers": {
     "web": {
       "command": "mcp/.venv/bin/python",
-      "args": ["mcp/web_server.py"],
+      "args": [
+        "mcp/web_server.py"
+      ],
       "timeout_ms": 30000
+    },
+    "browser": {
+      "command": "mcp/browser.sh",
+      "args": [],
+      "timeout_ms": 60000
     }
   }
 }

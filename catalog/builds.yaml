@@ -7,7 +7,7 @@ builds:
     ref: 7ceed8737fdb4eb09b4760e77bd12d38012de5a8   # pinned: the commit this repo was verified against (tag b11002)
     dir: vendor/llama.cpp
     cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
-    status: built+verified on gpu2260 2026-09-16 (see _out.md)
+    status: built+verified on 8x RTX A5000 2026-09-16
 
   poolside-laguna:
     remote: https://github.com/poolsideai/llama.cpp
@@ -24,7 +24,7 @@ builds:
     cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
     for: [glm-5.3-flash]
     status: |
-      llama-server BUILT on gpu2260 2026-09-16 (~6 min, `vendor/llama.cpp-glm53/build/bin/`,
+      llama-server BUILT on 8x RTX A5000 2026-09-16 (~6 min, `vendor/llama.cpp-glm53/build/bin/`,
       807M build dir). `cmake --build --target llama-app` failed with "No rule to make target
       'llama-app'" - this PR branch predates that CMake target - so `llm build` reports a nonzero
       exit even though llama-server/llama-cli/llama-bench/llama-gguf-split all linked fine. Not
@@ -45,7 +45,7 @@ builds:
     cmake: [-DGGML_CUDA=ON, -DLLAMA_CURL=OFF]
     for: [qwen3.8-flash-next, qwen3.8-27b]   # MTP draft weights exist for both (unsloth, see notes) - see caveat below
     status: |
-      llama-server BUILT on gpu2260 2026-09-16 (~4 min), same `llama-app` gap as glm53 (harmless -
+      llama-server BUILT on 8x RTX A5000 2026-09-16 (~4 min), same `llama-app` gap as glm53 (harmless -
       only the CLI downloader target, not the router). MEASURED: this binary FAILS to load
       qwen3.8-27b (UD-Q5_K_XL) - "llama_model_load: error loading model: missing tensor
       'blk.64.ssm_conv1d.weight'" - i.e. this PR's tree predates (or conflicts with) the qwen35

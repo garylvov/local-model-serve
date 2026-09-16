@@ -15,18 +15,29 @@ SESSION="${LLM_SESSION:-llm}"
 RUN="$ROOT/run/$HOST/$SESSION"
 URL="http://127.0.0.1:$PORT"
 
+# Site settings (public URL, gateway host, Cloudflare zone ...) live in ONE gitignored file so the
+# code stays generic: $ROOT/config.env, else ~/.config/local-model-serve/config.env.
+# See config.example.env. Environment variables still win over the file.
+for cfg in "${LLM_SITE_CONFIG:-}" "$ROOT/config.env" "$CONF/config.env"; do
+  [[ -n "$cfg" && -r "$cfg" ]] || continue
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+    [[ -n "${!k:-}" ]] || export "$k=${v%%#*}"
+  done < <(grep -E '^[A-Z_][A-Z0-9_]*=' "$cfg" | sed -E 's/[[:space:]]+#.*$//; s/^([A-Z_0-9]+)="?([^"]*)"?$/\1=\2/')
+  break
+done
+
 # Optional LLM_GATEWAY_URL / LLM_PEER_URL / LLM_PEER_CF_ACCESS may also live in auth.env.
 [[ -r "$AUTH" ]] && eval "$(grep -E '^(LLM_GATEWAY_URL|LLM_PEER_URL|LLM_PEER_CF_ACCESS)=' "$AUTH" | sed 's/^/: "${/; s/=/:=/; s/$/}";/')"
 GW_PORT="${LLM_GATEWAY_PORT:-4000}"
-# The gateway runs on a login node so it outlives any Slurm job (no GPU needed).
-# Override with LLM_GATEWAY_HOST / LLM_GATEWAY_URL (or LLM_GATEWAY_URL=none to not join one).
-GW_HOST="${LLM_GATEWAY_HOST:-login009}"
-LLM_PUBLIC_URL="${LLM_PUBLIC_URL:-https://llm.garylvov.com}"
-# On-cluster machines reach the gateway directly; everyone else goes through the public hostname.
-# Detected, never asked: login009 only resolves inside Oscar.
-if getent hosts "$GW_HOST" >/dev/null 2>&1; then ON_CLUSTER=1; else ON_CLUSTER=0; fi
+# LLM_GATEWAY_HOST: the gateway's hostname on the private network (on Slurm, a login node, so it
+# outlives jobs). LLM_PUBLIC_URL: the gateway's public URL. Machines that can resolve the private
+# host talk to it directly; everything else goes through the public URL.
+GW_HOST="${LLM_GATEWAY_HOST:-}"
+LLM_PUBLIC_URL="${LLM_PUBLIC_URL:-}"
+if [[ -n "$GW_HOST" ]] && getent hosts "$GW_HOST" >/dev/null 2>&1; then ON_CLUSTER=1; else ON_CLUSTER=0; fi
 if (( ON_CLUSTER )); then : "${LLM_GATEWAY_URL:=http://$GW_HOST:$GW_PORT}"
-else : "${LLM_GATEWAY_URL:=$LLM_PUBLIC_URL}"; fi
+else : "${LLM_GATEWAY_URL:=${LLM_PUBLIC_URL:-none}}"; fi
 
 die() { echo "llm: $*" >&2; exit 1; }
 say() { echo "llm: $*"; }
@@ -46,7 +57,7 @@ preset() { # the preset file for this machine: $LLM_PRESET, else remembered choi
   [[ -z "$name" && -f "$RUN/preset" ]] && name="$(cat "$RUN/preset")"
   if [[ -z "$name" ]]; then
     case "$(gpu_count)" in
-      8) name=oscar-8x ;; 4) name=quad-24g ;; 2) name=dual-24g ;; 1) name=single-24g ;;
+      8) name=8x-24g ;; 4) name=quad-24g ;; 2) name=dual-24g ;; 1) name=single-24g ;;
       *) die "no preset for $(gpu_count) GPU(s); set LLM_PRESET=<name> (see presets/)" ;;
     esac
   fi
@@ -117,7 +128,7 @@ cmd_auth() {
       say "wrote $AUTH (LLM_BASE_URL=$base)" ;;
     print-client)  # pipe to another machine; refuses to print a key onto a terminal
       [[ -t 1 ]] && die "refusing to print the key to a terminal; pipe it: llm auth print-client [URL] | ssh host 'umask 077; mkdir -p ~/.config/local-model-serve; cat > ~/.config/local-model-serve/auth.env'"
-      printf 'LLM_BASE_URL=%s\nLLM_API_KEY=%s\n' "${2:-https://llm.garylvov.com}" "$(<"$KEYFILE")" ;;
+      printf 'LLM_BASE_URL=%s\nLLM_API_KEY=%s\n' "${2:-${LLM_PUBLIC_URL:?set LLM_PUBLIC_URL or pass a URL}}" "$(<"$KEYFILE")" ;;
     *) die "usage: llm auth init [BASE_URL] | print-client [BASE_URL]" ;;
   esac
 }
@@ -156,6 +167,17 @@ gpu_json() { # live per-GPU numbers for the gateway status page (no prompts, no 
     --format=csv,noheader,nounits 2>/dev/null | jq -Rs 'split("\n") | map(select(length > 0) | split(", ") |
       {index: (.[0]|tonumber), name: .[1], util: (.[2]|tonumber), mem_used: (.[3]|tonumber),
        mem_total: (.[4]|tonumber), temp: (.[5]|tonumber), power: (.[6]|tonumber? // null)})' || echo "[]"
+}
+
+host_json() { # CPU and RAM for the Hardware page: 1 s CPU sample from /proc/stat, RAM from /proc/meminfo
+  local a b
+  a=($(awk '/^cpu /{print $2+$3+$4+$7+$8, $5+$6}' /proc/stat)); sleep 1
+  b=($(awk '/^cpu /{print $2+$3+$4+$7+$8, $5+$6}' /proc/stat))
+  local busy=$(( b[0]-a[0] )) idle=$(( b[1]-a[1] ))
+  awk -v busy="$busy" -v idle="$idle" -v cores="$(nproc)" -v model="$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)" '
+    /^MemTotal:/{tot=$2} /^MemAvailable:/{avail=$2} /^Cached:/{cache=$2} /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2}
+    END{ printf "{\"cpu_util\": %.1f, \"cores\": %d, \"cpu_model\": \"%s\", \"mem_total_gib\": %.1f, \"mem_used_gib\": %.1f, \"mem_cache_gib\": %.1f, \"swap_used_gib\": %.1f}",
+         (busy+idle) ? 100*busy/(busy+idle) : 0, cores, model, tot/1048576, (tot-avail)/1048576, cache/1048576, (st-sf)/1048576 }' /proc/meminfo
 }
 
 disk_free_gib() { df -B1 --output=avail "$LLAMA_CACHE" 2>/dev/null | tail -1 | awk '{printf "%.1f", $1/1073741824}'; }
@@ -274,7 +296,8 @@ gw_post() { # gw_post /peers/register|/peers/deregister
   local body; body="$(jq -nc --arg u "$(peer_url)" --arg h "$HOST" \
     --argjson cf "${LLM_PEER_CF_ACCESS:-false}" --argjson g "$(gpu_json)" \
     --argjson preset "$(preset_json)" --arg disk "$(disk_free_gib)" --argjson results "$results" \
-    '{url: $u, host: $h, cf_access: $cf, gpus: $g, preset: $preset, disk_free_gib: ($disk | tonumber? // null), results: $results}')"
+    --argjson sys "$(host_json 2>/dev/null || echo null)" \
+    '{url: $u, host: $h, cf_access: $cf, gpus: $g, sys: $sys, preset: $preset, disk_free_gib: ($disk | tonumber? // null), results: $results}')"
   printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS --max-time 10 -K - -X POST \
     -H 'Content-Type: application/json' "${LLM_GATEWAY_URL%/}$1" --data "$body"
 }
@@ -417,10 +440,11 @@ cmd_tunnel() { # this machine's own cloudflared: a named tunnel if a token exist
       [[ -x "$cf" ]] || die "cloudflared not found (install to ~/.local/bin; see README)"
       : > "$RUN/tunnel.log"
       if [[ -r "$tok" ]]; then
-        # named tunnel: token file only, never inline (and never the slurm-dash token)
+        # named tunnel: token file only, never inline. LLM_FOREIGN_TUNNEL_TOKEN may name a token that
+        # belongs to another service; running a second connector on it would steal its traffic.
         [[ "$(stat -c %a "$tok")" == 600 ]] || die "$tok must be mode 0600"
-        if [[ -r "$HOME/.config/slurm-dash/tunnel-token" ]] && cmp -s "$tok" "$HOME/.config/slurm-dash/tunnel-token"; then
-          die "refusing: that is the Oscar dashboard tunnel token; every machine needs its own"
+        if [[ -n "${LLM_FOREIGN_TUNNEL_TOKEN:-}" && -r "$LLM_FOREIGN_TUNNEL_TOKEN" ]] && cmp -s "$tok" "$LLM_FOREIGN_TUNNEL_TOKEN"; then
+          die "refusing: $tok is another service's tunnel token; every machine needs its own"
         fi
         local proto="${LLM_TUNNEL_PROTOCOL:-quic}"
         tmux new-session -d -s "$SESSION-tunnel" -e "TUNNEL_TOKEN_FILE=$tok" \
@@ -458,7 +482,7 @@ cmd_tunnel() { # this machine's own cloudflared: a named tunnel if a token exist
 cmd_join() { # ONE command to attach this machine: build if needed, serve, register, report
   if [[ "${1:-}" == --client ]]; then
     local base key
-    read -rp "LLM base URL (e.g. https://llm.garylvov.com): " base
+    read -rp "LLM base URL (e.g. https://llm.example.com): " base
     read -rsp "API key: " key; echo
     install -d -m 700 "$CONF"
     (umask 077; printf 'LLM_BASE_URL=%s\nLLM_API_KEY=%s\n' "$base" "$key" > "$AUTH")

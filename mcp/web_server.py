@@ -30,7 +30,7 @@ MAX_BYTES = int(os.environ.get("WEB_FETCH_MAX_BYTES", 2 * 1024 * 1024))
 MAX_CHARS = int(os.environ.get("WEB_FETCH_MAX_CHARS", 20000))
 TIMEOUT = float(os.environ.get("WEB_FETCH_TIMEOUT", 15))
 MAX_REDIRECTS = 5
-UA = "Mozilla/5.0 (compatible; llm-garylvov-web/1.0; +https://llm.garylvov.com)"
+UA = "Mozilla/5.0 (compatible; local-model-serve-web/1.0)"
 CONF = Path(os.environ.get("LLM_CONFIG_DIR", Path.home() / ".config/local-model-serve"))
 # Beyond ipaddress's is_global, name the ranges the operator asked for explicitly.
 BLOCKED = [ipaddress.ip_network(n) for n in (
@@ -61,7 +61,7 @@ def resolve(host: str) -> list[str]:
         ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)})
     except socket.gaierror:
         ips = []
-    if not ips:  # Oscar's resolver misses some public names: ask Cloudflare DoH by IP
+    if not ips:  # some cluster resolvers miss public names: ask Cloudflare DoH by IP
         try:
             r = httpx.get("https://1.1.1.1/dns-query", params={"name": host, "type": "A"},
                           headers={"accept": "application/dns-json"}, timeout=5)

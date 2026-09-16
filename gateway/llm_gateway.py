@@ -183,7 +183,7 @@ _dns: dict = {}  # host -> (ip or None, ts)
 
 
 async def resolve(host: str):
-    """Oscar's resolver returns nothing for *.trycloudflare.com (measured 2026-09-16), so when the
+    """Some cluster resolvers return nothing for *.trycloudflare.com (seen in practice), so when the
     system resolver fails, ask Cloudflare's DNS-over-HTTPS by IP. Returns an IP to dial, or None."""
     hit = _dns.get(host)
     if hit and time.time() - hit[1] < 300:
@@ -317,7 +317,7 @@ async def register(req: Request):
     p = peers.setdefault(url, {"models": {}, "ok": False, "inflight": 0, "gpus": [], "host": url,
                                "preset": {}, "disk_free_gib": None, "cmd_log": []})
     p.update(seen=time.time(), cf_access=bool(body.get("cf_access")),
-             gpus=body.get("gpus") or p.get("gpus") or [], host=body.get("host", url),
+             gpus=body.get("gpus") or p.get("gpus") or [], sys=body.get("sys") or p.get("sys"), host=body.get("host", url),
              preset=body.get("preset") or p.get("preset") or {},
              disk_free_gib=body.get("disk_free_gib", p.get("disk_free_gib")))
     for r in (body.get("results") or [])[:20]:
@@ -734,7 +734,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
 
 
 LOGIN_HTML = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>llm.garylvov.com</title><style>body{font:16px system-ui;background:#111;color:#eee;display:grid;
+<title>local models</title><style>body{font:16px system-ui;background:#111;color:#eee;display:grid;
 place-items:center;height:100vh;margin:0}form{display:grid;gap:.6rem;min-width:18rem}input,button{padding:.6rem;
 font:inherit;border-radius:.4rem;border:1px solid #444;background:#1c1c1c;color:#eee}button{cursor:pointer}
 .e{color:#f77}</style><form method=post action=/login><h1>local models</h1>
@@ -768,7 +768,7 @@ def peer_kind(url: str) -> str:
     host = httpx.URL(url).host
     if host.endswith(".trycloudflare.com"):
         return "quick tunnel"
-    return "home rig" if url.startswith("https://") else "Oscar"
+    return "remote" if url.startswith("https://") else "cluster"
 
 
 def status_data() -> dict:
@@ -777,7 +777,7 @@ def status_data() -> dict:
     now = time.time()
     return {"ts": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "heartbeat_ttl_s": TTL, "peers": [
         {"host": p.get("host", u), "url": u, "ok": p["ok"], "age_s": round(now - p["seen"]), "inflight": p["inflight"],
-         "models": p["models"], "gpus": p.get("gpus", []), "kind": peer_kind(u),
+         "models": p["models"], "gpus": p.get("gpus", []), "sys": p.get("sys"), "kind": peer_kind(u),
          "stale": now - p["seen"] > 45 or not p["ok"], "model_detail": p.get("detail", {})}
         for u, p in sorted(peers.items())]}
 
@@ -834,7 +834,7 @@ CHAT_LAUNCHER = (
     "</div></details>")
 
 HARDWARE_HTML = """<!doctype html><html lang=en><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>Hardware - llm.garylvov.com</title>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Hardware - local models</title>
 <meta name=color-scheme content="light dark"><style>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mute:#6b7280;--line:#e5e7eb;--track:#e9ecf0;--ok:#16a34a;
 --warn:#d97706;--hot:#dc2626;--acc:#2563eb}
@@ -887,6 +887,17 @@ const PALETTE=[350,205,140,40,275,95,320,165,10,240];
 function hashIdx(s){let h=0; for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0; return h%%PALETTE.length}
 function modelColor(name,copy){const l=copy?38:50; return `hsl(${PALETTE[hashIdx(name)]} 68%% ${l}%%)`}
 function dot(name,copy){return `<i class=mdot style="background:${modelColor(name,copy)}"></i>`}
+// CPU + RAM rows. RAM is stacked: memory held by processes, then page cache (mmap'd model weights
+// live there, so a model "in RAM" shows up as cache, not as used).
+function sysRows(s){
+  if(!s) return "";
+  const tot=+s.mem_total_gib||0, used=+s.mem_used_gib||0, cache=Math.min(+s.mem_cache_gib||0, Math.max(0,tot-used));
+  const pu=pct(used,tot), pc=pct(cache,tot);
+  const ram=`<div class=bar><i style="width:${pu.toFixed(1)}%%"></i><i style="left:${pu.toFixed(1)}%%;width:${pc.toFixed(1)}%%;opacity:.45"></i>`+
+    `<b>RAM ${used.toFixed(0)} used + ${cache.toFixed(0)} cache / ${tot.toFixed(0)} GiB${s.swap_used_gib>0.5?` · swap ${(+s.swap_used_gib).toFixed(0)} GiB`:""}</b></div>`;
+  return `<div class=gpu><span class=gi>CPU</span><span class=gn>${esc(s.cpu_model||"")}<span class=tag>${esc(s.cores)} cores</span></span>
+    <div class=bars>${bar(+s.cpu_util||0,`util ${(+s.cpu_util||0).toFixed(0)}%%`," u")}${ram}</div><span class=gt></span></div>`;
+}
 function render(d){
   document.getElementById("ts").textContent="updated "+d.ts;
   const g=document.getElementById("grid");
@@ -931,7 +942,7 @@ function render(d){
     return `<section class="card${p.stale?" stale":""}"><div class=top><span class=dot></span><span class=host>${esc(p.host)}</span>
       <span class=pill>${esc(p.kind)}</span><span class=pill>${p.stale?"offline":"online"}</span></div>
       <div class="sub mute">heartbeat ${ago(p.age_s)} ago | ${p.inflight} request(s) via gateway${p.stale?" | drops after "+d.heartbeat_ttl_s+"s":""}</div>
-      ${gpus||'<div class=mute>no GPU data</div>'}${models||'<div class="model mute">no model loaded</div>'}</section>`}).join("");
+      ${sysRows(p.sys)}${gpus||'<div class=mute>no GPU data</div>'}${models||'<div class="model mute">no model loaded</div>'}</section>`}).join("");
 }
 async function tick(){try{const r=await fetch("/status.json",{credentials:"same-origin",cache:"no-store"});
   if(r.status===401){location.href="/login";return} render(await r.json())}
@@ -948,7 +959,7 @@ async def status_page(req: Request):
 
 
 MODELS_HTML = """<!doctype html><html lang=en><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>Models - llm.garylvov.com</title>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Models - local models</title>
 <meta name=color-scheme content="light dark"><style>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mute:#6b7280;--line:#e5e7eb;--track:#e9ecf0;--ok:#16a34a;
 --warn:#d97706;--hot:#dc2626;--acc:#2563eb}

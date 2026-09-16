@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Plan the Cloudflare setup that lets ONE off-cluster machine be a gateway peer:
-#   <machine>.llm-peers.garylvov.com  ->  that machine's own cloudflared tunnel -> http://127.0.0.1:8080
+#   <machine>.llm-peers.<CF_ZONE>  ->  that machine's own cloudflared tunnel -> http://127.0.0.1:8080
 # protected by a Cloudflare Access application that accepts one Access service token
 # (the gateway sends CF-Access-Client-Id/Secret from ~/.config/local-model-serve/cf-access.env).
 #
@@ -8,18 +8,26 @@
 # already exists, then PRINTS every write it would make. `--apply` exists but is intentionally
 # refused unless LMS_CF_APPLY_OK=i-have-operator-approval is also set.
 #
-# Usage: scripts/cf-machine.sh <machine> [--port 8080] [--zone garylvov.com] [--apply]
-# Env:   CF_API_TOKEN_FILE (default ~/.config/slurm-dash/cloudflare-api-token)
+# Usage: scripts/cf-machine.sh <machine> [--port 8080] [--zone example.com] [--apply]
+# Config: CF_ZONE, CF_API_TOKEN_FILE, LLM_PUBLIC_URL (config.env or environment)
 #
-# Never reuses the Oscar slurm-dash tunnel token: each machine gets its OWN tunnel and token,
-# because a second connector on the same token would break the existing ccv/grove/dag routes.
+# Each machine gets its OWN tunnel and token: a second connector on an existing token would
+# receive a share of that tunnel's traffic and break whatever else it serves.
 set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# site settings (CF_ZONE, LLM_PUBLIC_URL, CF_API_TOKEN_FILE ...) from config.env; env vars win
+for cfg in "${LLM_SITE_CONFIG:-}" "$ROOT/config.env" "$HOME/.config/local-model-serve/config.env"; do
+  [[ -n "$cfg" && -r "$cfg" ]] || continue
+  while IFS='=' read -r k v; do [[ -n "${!k:-}" ]] || export "$k=${v/#\~/$HOME}"; done \
+    < <(grep -E '^[A-Z_][A-Z0-9_]*=' "$cfg" | sed -E 's/[[:space:]]+#.*$//')
+  break
+done
 
 MACHINE="${1:-}"; shift || true
 [[ -n "$MACHINE" && "$MACHINE" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "usage: cf-machine.sh <machine> [--apply]" >&2; exit 2; }
-ZONE_NAME=garylvov.com; PORT=8080; APPLY=0
+ZONE_NAME="${CF_ZONE:-}"; PORT=8080; APPLY=0
 SUBDOMAIN_SUFFIX="llm-peers"
-TOKEN_FILE="${CF_API_TOKEN_FILE:-$HOME/.config/slurm-dash/cloudflare-api-token}"
+TOKEN_FILE="${CF_API_TOKEN_FILE:-$HOME/.config/local-model-serve/cloudflare-api-token}"
 API=https://api.cloudflare.com/client/v4
 
 while [[ $# -gt 0 ]]; do
@@ -67,7 +75,7 @@ cat <<PLAN
 planned writes (NOT executed in dry-run):
 1. POST $API/accounts/<account>/cfd_tunnel
    {"name": "$TUNNEL_NAME", "config_src": "cloudflare"}
-   -> a NEW tunnel, separate from the slurm-dash one. Never copy an existing token.
+   -> a NEW tunnel, separate from any existing one. Never copy an existing token.
 2. PUT  $API/accounts/<account>/cfd_tunnel/<new-tunnel>/configurations
    {"config": {"ingress": [{"hostname": "$HOSTNAME_FQDN", "service": "http://127.0.0.1:$PORT"},
                             {"service": "http_status:404"}]}}
@@ -86,7 +94,7 @@ planned writes (NOT executed in dry-run):
    -> install on THAT machine as ~/.config/local-model-serve/tunnel-token (0600), then:
       llm tunnel up        # cloudflared --protocol quic, falls back to http2
       # in ~/.config/local-model-serve/auth.env on that machine:
-      LLM_GATEWAY_URL=https://llm.garylvov.com
+      LLM_GATEWAY_URL=$LLM_PUBLIC_URL
       LLM_PEER_URL=https://$HOSTNAME_FQDN
       LLM_PEER_CF_ACCESS=true
       llm serve            # starts the router and heartbeats the peer URL to the gateway
