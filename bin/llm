@@ -127,9 +127,18 @@ cmd_serve() {
   [[ -x "$BIN/llama-server" ]] || die "llama.cpp not built; run scripts/build-llama.sh"
   [[ -s "$KEYFILE" ]] || cmd_auth init
   local p; p="$(preset)"; basename "$p" .ini > "$RUN/preset"
+  # Web search/fetch MCP tools (mcp/web.json). They must be on the ROUTER's command line: the router
+  # answers GET/POST /tools itself (children inherit the flag). Never add --tools/--agent here:
+  # those expose the local filesystem on a public endpoint. LLM_MCP_CONFIG= (empty) disables.
+  local mcp="" mcfg="${LLM_MCP_CONFIG-mcp/web.json}"
+  if [[ -n "$mcfg" && -f "$ROOT/$mcfg" && -x "$ROOT/mcp/.venv/bin/python" ]]; then
+    mcp="--mcp-servers-config '$mcfg'"
+  elif [[ -n "$mcfg" && -f "$ROOT/$mcfg" ]]; then
+    say "web tools disabled: create the venv first (uv venv mcp/.venv && uv pip install -p mcp/.venv/bin/python httpx ddgs)"
+  fi
   say "preset $(basename "$p") ($(gpu_count) GPUs), models: $(sections | tr '\n' ' ')"
   tmux new-session -d -s "$SESSION" -c "$ROOT" -e "LLAMA_CACHE=$LLAMA_CACHE" \
-    "exec '$BIN/llama-server' --models-preset '$p' --no-models-autoload --models-max ${LLM_MODELS_MAX:-8} \
+    "exec '$BIN/llama-server' --models-preset '$p' --no-models-autoload --models-max ${LLM_MODELS_MAX:-8} $mcp \
        --host 0.0.0.0 --port $PORT --api-key-file '$KEYFILE' >> '$RUN/router.log' 2>&1"
   local t0=$SECONDS
   until healthy; do

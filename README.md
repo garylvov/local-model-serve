@@ -176,6 +176,64 @@ llm gateway status    # registered peers, their models, in-flight counts
 Cloudflare Access in front of `llm.garylvov.com` would be stronger than the password login;
 it is documented but deliberately not applied here.
 
+## Hardware tab
+
+`https://llm.garylvov.com/status` (tab bar "Chat | Hardware" at the top of both pages) shows one card
+per machine: online/offline (greyed out after a missed heartbeat, dropped after 90 s), whether it is
+on Oscar, a home rig or behind a quick tunnel (URLs are never shown), per-GPU utilisation and VRAM
+bars with temperature and power, and each loaded model with its GPUs, in-flight requests, busy slots,
+throughput over the last 60 s, last measured decode speed and peak context per slot. It is plain
+HTML + vanilla JS polling `/status.json` every 2 s, follows the OS light/dark setting and works on a
+phone. `/status.json` keeps its original keys and adds `kind`, `stale`, `heartbeat_ttl_s` and
+`model_detail`. The tab bar is injected only into the WebUI's HTML shell; assets, API and streaming
+responses pass through byte for byte.
+
+Deploy after editing the gateway:
+
+```bash
+ssh login009 'cd /oscar/data/stellex/glvov/local-model-serve && bin/llm gateway down && bin/llm gateway up'
+```
+
+## Web tools (search + fetch via MCP)
+
+llama-server's own MCP support (`--mcp-servers-config`, stdio transport) exposes two tools,
+`web_search` and `web_fetch`, from `mcp/web_server.py` (declared in `mcp/web.json`). `llm serve` puts
+the flag on the **router** command line, because the router itself answers `GET /tools` (the WebUI
+lists them there) and `POST /tools` (the WebUI executes tool calls there); model children inherit it.
+A preset `[*]` entry would only reach the children, so it is not used for this.
+
+One-time setup on a node that runs a router (installed under the repo, not `$HOME`):
+
+```bash
+UV_CACHE_DIR=/oscar/data/stellex/glvov/.uv-cache uv venv -p 3.12 mcp/.venv
+uv pip install -p mcp/.venv/bin/python httpx ddgs
+```
+
+* **Search** uses DuckDuckGo with no key. Put a Brave Search key in
+  `~/.config/local-model-serve/brave-api-key` (mode 0600) to switch to Brave.
+* **Fetch** returns readable text, capped at 2 MiB downloaded / 20,000 characters / 15 s.
+* **API clients** run the same loop the WebUI does: `GET /tools`, pass the `definition`s as
+  `tools` to `/v1/chat/completions`, execute each tool call with
+  `POST /tools {"tool": "web_fetch", "params": {...}}`, and send the result back as a `tool` message.
+  `mcp/agent_loop_example.py` does exactly that.
+
+Security on this public endpoint:
+
+* `web_fetch` refuses anything but http/https, URLs with credentials, and any host that resolves
+  to a non-public address (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, 100.64/10, ::1, fc00::/7,
+  fe80::/10, multicast, reserved...). It checks after DNS resolution, pins the connection to the
+  vetted IP (no DNS rebinding) and re-checks every redirect hop. Verified refusals:
+  `http://slurm01:9390`, `http://login009:4000`, `http://127.0.0.1:8080`, `http://169.254.169.254`,
+  `http://[::1]:8080`, `http://0x7f000001/`, `file:///etc/passwd`, and redirects from a public URL to
+  127.0.0.1 or 169.254.169.254.
+* `--tools` / `--agent` (local filesystem tools) are **not** enabled, and `--cors-origins` is left at
+  its MCP default (localhost only; the gateway talks to the router server-side).
+* The gateway strips client-supplied `x-tool-cwd`, `x-tool-runtime` and `x-resp-type` headers, so
+  nobody on the internet can redirect tool execution to another working directory or runtime.
+* `/tools` needs the login cookie or the bearer key like every other path.
+* Oscar's resolver misses some public names (see the trycloudflare note); `web_fetch` falls back to
+  Cloudflare DNS-over-HTTPS and still applies the same address checks to the answer.
+
 ## Everyday commands
 
 | command | what it does |

@@ -383,6 +383,91 @@ the peer is unaffected. Not measured: the agent → `https://llm.garylvov.com` l
 **Also:** the Qwen3.8-Flash-Next UD-Q4_K_XL download finished (all 4 shards present); it has not been
 loaded yet - `bin/llm up flashnext` on GPUs 0-5.
 
+## Hardware tab (web UI)
+
+Approach: the llama.cpp WebUI shell (`/`, ~7 KB of HTML, shipped pre-gzipped) is the only response
+rewritten. The gateway reads it (httpx undoes the gzip), inserts a fixed "Chat | Hardware" pill
+before `</body>` and serves it uncompressed with `cache-control: no-store`; the hashed JS/CSS assets
+and every API/SSE response still stream through untouched (the 2.6 MB bundle through the public URL
+was byte-identical to the router's). The WebUI has no CSP, so inline styles are fine.
+
+`/status` is now the hardware page (light/dark via `prefers-color-scheme`, responsive grid, vanilla
+JS polling `/status.json` every 2 s). Tested through `https://llm.garylvov.com` with the bearer key
+(the operator's password is not readable here, so no test cookie was created):
+
+```
+/status 200 text/html | /status.json 200 application/json | / 200 text/html with <nav id=llm-tabs ...>
+unauth: /status 303 -> /login, / 303 -> /login, /status.json 401, /v1/models 401
+streaming chat via https://llm.garylvov.com: 200, TTFB 0.039 s, 503 SSE chunks in 19.4 s
+/status.json peers[0] (existing keys unchanged, new keys added):
+ {"host":"gpu2260","kind":"Oscar","stale":false,"age_s":26,
+  "m":{"state":"loaded","gpus":[6,7],"parallel":4,"tok_s":12.9,"avg_tok_s":26.2,"inflight":1,
+       "queued":0,"slots":4,"slots_busy":1,"ctx_peak":1247,"ctx_slot":65536},
+  "gpu6":{"index":6,"name":"NVIDIA RTX A5000","util":0,"mem_used":15023,"mem_total":23028,"temp":32,"power":24.57}}
+```
+
+Metric honesty notes: this llama.cpp build exports no live KV-cache-usage metric, so the page shows
+the peak context any request reached per slot (`n_tokens_max / n_ctx`). `tokens_predicted_total`
+only grows when a request finishes, and the `*_seconds` gauges reset on every `/metrics` scrape, so
+"current tok/s" is shown as throughput over a sliding 60 s window plus the last non-zero decode speed
+(26.2 tok/s, matching the benchmark). GPU-to-model mapping comes from the `--device CUDAn` in the
+router's status args; router args are never passed to the page because they contain file paths.
+
+## Web tools via MCP (search + fetch)
+
+Built on llama-server's own MCP support. `mcp/web_server.py` is a dependency-light stdio MCP
+server (httpx + `ddgs`, venv at `mcp/.venv`, gitignored) with `search` (DuckDuckGo, or Brave if
+`~/.config/local-model-serve/brave-api-key` exists) and `fetch`. Declared in `mcp/web.json`.
+
+Where the flag must go: the router answers `GET /tools` and `POST /tools` itself (`server.cpp`
+registers them on whichever process has MCP configured, router included), so `--mcp-servers-config`
+goes on the router's command line in `llm serve`; children inherit it. A preset `[*]` key would only
+reach children and `/tools` on the router would stay 403. Router log:
+`MCP warmup: 'web' discovered 2 tools` / `Added 2 MCP tools`; `GET /tools` lists `web_search`,
+`web_fetch`. Execution is client-driven: the WebUI (or an API client) calls `POST /tools`.
+`--tools`/`--agent` are not enabled; CORS stays at the MCP default (localhost).
+
+SSRF tests (direct, and via `POST https://llm.garylvov.com/tools` with a hostile
+`x-tool-runtime: ssh:login009` header, which the gateway now strips):
+
+```
+http://slurm01:9390         refused: slurm01 resolves to a non-public address
+http://login009:4000        refused: login009 resolves to a non-public address
+http://127.0.0.1:8080       refused: 127.0.0.1 resolves to a non-public address
+http://169.254.169.254      refused: 169.254.169.254 resolves to a non-public address
+http://[::1]:8080, http://10.0.0.1, http://0x7f000001/, http://localhost:8080   refused
+file:///etc/passwd          refused: scheme 'file' is not allowed
+http://user:pw@example.com  refused: URLs with credentials are not allowed
+https://httpbin.org/redirect-to?url=http://127.0.0.1:8080/        refused on the redirect hop
+https://httpbin.org/redirect-to?url=http://169.254.169.254/       refused on the redirect hop
+unauthenticated GET /tools 303 (login), POST /tools 401
+```
+
+DNS from the compute node: duckduckgo.com, en.wikipedia.org, www.python.org, api.search.brave.com,
+news.ycombinator.com all resolve with Oscar's resolver; the DoH fallback is there for names that don't.
+
+End-to-end tool trace through `https://llm.garylvov.com` (qwen3.8-27b, client loop `run/agent_loop.py`):
+
+```
+turn 0: model 3.7 s -> web_search({"query": "latest stable Python 3 release version", "max_results": 6})   0.89 s
+turn 1: model 8.3 s -> web_fetch({"url": "https://www.python.org/downloads/", "max_chars": 6000})          0.16 s
+                    -> web_fetch({"url": "https://blog.python.org/2026/06/python-3146-31314/", "max_chars": 4000}) 0.28 s
+turn 2: model 19.5 s, finish=stop
+ANSWER: The newest stable Python 3 release is Python 3.14.7, released on August 5, 2026, according to
+the official python.org downloads page. [...] Source: https://www.python.org/downloads/
+```
+
+Latency per tool call (3 runs each, `POST /tools`):
+
+| path | web_fetch (python.org) | web_search (DuckDuckGo) |
+| --- | --- | --- |
+| router direct | 0.070 / 0.061 / 0.062 s | 0.611 (cold) / 0.069 / 0.073 s |
+| login009 gateway | 0.078 / 0.063 / 0.069 s | 0.074 / 0.074 / 0.083 s |
+| https://llm.garylvov.com | 0.133 / 0.133 / 0.140 s | 0.145 / 0.153 / 0.143 s |
+
+So the gateway adds ~5-10 ms and Cloudflare ~70 ms per tool call; the upstream site dominates
+otherwise (0.9 s for a cold search inside the agent loop).
+
 ## Needs an operator decision
 
 1. **Cloudflare route: approved by the operator, but BLOCKED on this machine.** The intended call is

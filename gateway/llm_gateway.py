@@ -26,7 +26,10 @@ COOKIE, COOKIE_TTL = "llm_session", 12 * 3600
 LOGIN_WINDOW, LOGIN_MAX = 300, 5  # failed logins per IP per window
 SESSION_HEADERS = ("x-session-id", "x-litellm-session-id", "x-claude-code-session-id", "session-id", "conversation-id")
 HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "upgrade",
-       "authorization", "x-api-key", "accept-encoding", "proxy-authorization"}
+       "authorization", "x-api-key", "accept-encoding", "proxy-authorization",
+       # llama-server tool-execution overrides: never let internet clients pick a cwd or a runtime
+       # (e.g. "ssh:<host>" / "docker-container:<id>") for POST /tools
+       "x-tool-cwd", "x-tool-runtime", "x-resp-type"}
 
 
 def cf_access_headers() -> dict:

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "web": {
+      "command": "mcp/.venv/bin/python",
+      "args": ["mcp/web_server.py"],
+      "timeout_ms": 30000
+    }
+  }
+}
