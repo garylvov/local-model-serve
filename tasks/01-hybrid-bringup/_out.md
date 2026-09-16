@@ -305,12 +305,52 @@ connectors serving one token is why `http://localhost:4000` is safe here - but i
 ever started on another host, `localhost` would resolve on that host instead, so either keep both
 connectors on login009 or change the origin to `http://login009:4000`.
 
+## One-command node attach (added after the operator's second round)
+
+`llm join` is now the whole flow and takes no arguments: it checks the GPUs, builds llama.cpp only
+if the pinned build is missing, picks the preset by GPU count, starts the router (whose preset marks
+one model `load-on-startup = true`, so it loads itself), starts the 30 s heartbeat to
+`http://$LLM_GATEWAY_HOST:4000` (default `login009`), and prints the model table. `llm leave`
+deregisters and stops heartbeat, tunnel and router.
+
+Tested on gpu2260 by tearing the node down and bringing it back:
+
+```
+$ llm leave      -> router stopped, gateway /peers == []   (all GPUs back to ~30 MiB)
+$ llm join       -> llama.cpp already built (7ceed8737)
+                    preset oscar-8x.ini (8 GPUs)
+                    router up on 0.0.0.0:8080
+                    heartbeating http://gpu2260:8080 to http://login009:4000
+                    qwen3.8-27b loading (auto, load-on-startup)   [1.4 s wall for the command]
+$ llm join       -> idempotent: "router already running", re-registers, prints the table
+gateway: /v1/models == ["qwen3.8-27b"], chat completion through login009 == 200
+```
+
+One bug found and fixed on the way: `--models-max 0` (unlimited) is rejected when any preset uses
+`load-on-startup` ("number of models to load on startup (1) exceeds models_max (0)"), so the router
+now runs with `--models-max ${LLM_MODELS_MAX:-8}`.
+
+Abrupt job death is covered by the same path as the earlier dead-peer test: heartbeat TTL 90 s with
+a 10 s poll, measured drop 100 s after a hard kill, and `/v1/models` stops advertising the models.
+A second GPU node was not allocated (no idle gpu nodes in `sinfo` at the time, and allocating one
+was outside what the brief allows), so the test was the leave/join cycle on gpu2260.
+
+README documents the copy-paste lines, including `ssh <node> 'cd <repo> && bin/llm join'` (preferred,
+survives the step) and the `srun --overlap --jobid <id> --pty bash` alternative.
+
 ## Needs an operator decision
 
-1. **Approve and apply the Cloudflare route**:
-   `scripts/cf-route.sh --service http://localhost:4000 --apply` (origin now on login009, so it no
-   longer dies with the Slurm job). Until it is applied nothing answers at `https://llm.garylvov.com`
-   and the Cloudflare streaming test cannot be run.
+1. **Cloudflare route: approved by the operator, but BLOCKED on this machine.** The intended call is
+   `scripts/cf-route.sh --service http://login009:4000 --apply` (host-qualified origin, per the
+   operator). I re-checked the live config first: version 10, ingress still exactly
+   ccv (unix socket) / grove (http://gpu3201:8874) / dag (http://localhost:8501) / http_status:404,
+   saved to `run/ingress-before.json` for rollback. The `--apply` run was then refused by the Claude
+   Code permission layer ("DNS / Domain / Cert Changes"), which only the human operator can grant, so
+   **no write was made and nothing at `https://llm.garylvov.com` answers yet**. Either allow that
+   Bash action and re-run the one command, or run it yourself; afterwards the checks to run are
+   `curl -o /dev/null -w '%{http_code}' https://llm.garylvov.com/v1/models` (401 without a key,
+   200 with), `https://ccv.garylvov.com/api/health` (must stay 200), and a streaming completion for
+   TTFB/tok/s through Cloudflare versus direct.
 2. **Set the browser password**: `llm passwd` (mine is random and unknown). Optionally put
    Cloudflare Access in front of `llm.garylvov.com` instead — stronger, and documented, not applied.
 3. **Big model**: confirm Qwen3.8-Flash-Next UD-Q4_K_XL as the GPUs 0–5 model once downloaded, or
