@@ -18,6 +18,10 @@ URL="http://127.0.0.1:$PORT"
 # Optional LLM_GATEWAY_URL / LLM_PEER_URL / LLM_PEER_CF_ACCESS may also live in auth.env.
 [[ -r "$AUTH" ]] && eval "$(grep -E '^(LLM_GATEWAY_URL|LLM_PEER_URL|LLM_PEER_CF_ACCESS)=' "$AUTH" | sed 's/^/: "${/; s/=/:=/; s/$/}";/')"
 GW_PORT="${LLM_GATEWAY_PORT:-4000}"
+# The gateway runs on a login node so it outlives any Slurm job (no GPU needed).
+# Override with LLM_GATEWAY_HOST / LLM_GATEWAY_URL (or LLM_GATEWAY_URL=none to not join one).
+GW_HOST="${LLM_GATEWAY_HOST:-login009}"
+: "${LLM_GATEWAY_URL:=http://$GW_HOST:$GW_PORT}"
 
 die() { echo "llm: $*" >&2; exit 1; }
 say() { echo "llm: $*"; }
@@ -149,7 +153,8 @@ gw_post() { # gw_post /peers/register|/peers/deregister
 }
 
 heartbeat() {
-  [[ -n "${LLM_GATEWAY_URL:-}" ]] || { [[ "$1" == start ]] && say "no LLM_GATEWAY_URL: not joining a gateway"; return 0; }
+  [[ -n "${LLM_GATEWAY_URL:-}" && "$LLM_GATEWAY_URL" != none ]] || {
+    [[ "$1" == start ]] && say "LLM_GATEWAY_URL=none: not joining a gateway"; return 0; }
   case "$1" in
     start) tmux has-session -t ="$SESSION-heartbeat" 2>/dev/null && return 0
            # tmux does not inherit this shell's env, so pass the peer identity explicitly
@@ -171,8 +176,9 @@ cmd_gateway() {
         if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
           uv venv -q -p 3.12 "$ROOT/.venv" && uv pip install -q -p "$ROOT/.venv/bin/python" httpx starlette uvicorn
         fi
-        tmux new-session -d -s llm-gateway -c "$ROOT/gateway" "exec '$ROOT/.venv/bin/python' -m uvicorn llm_gateway:app \
-          --host 0.0.0.0 --port $GW_PORT --no-access-log --timeout-keep-alive 75 >> '$RUN/gateway.log' 2>&1"
+        [[ "$HOST" == "$GW_HOST" ]] || say "note: starting a gateway on $HOST, but peers default to $GW_HOST (LLM_GATEWAY_HOST)"
+        tmux new-session -d -s llm-gateway -c "$ROOT/gateway" "exec nice -n 5 '$ROOT/.venv/bin/python' -m uvicorn \
+          llm_gateway:app --host 0.0.0.0 --port $GW_PORT --no-access-log --timeout-keep-alive 75 >> '$RUN/gateway.log' 2>&1"
         sleep 3; curl -sf "http://127.0.0.1:$GW_PORT/health" && echo && say "gateway up on 0.0.0.0:$GW_PORT" ;;
     down) tmux kill-session -t =llm-gateway 2>/dev/null; say "gateway down" ;;
     status) printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS -K - "http://127.0.0.1:$GW_PORT/peers" | jq . ;;

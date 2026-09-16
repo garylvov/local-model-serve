@@ -70,7 +70,11 @@ models:
     draft: {dflash: "laguna-s-2.1-DFlash-BF16.gguf (2.08 GiB); upstream loader rejects it (issue #26669,
       'expected 76, got 69'); full support is in the poolsideai/llama.cpp `laguna` branch"}
     issues: ["#27899 CUDA NaN logits for some Laguna-S k-quant mixes", "DFlash unusable on master"]
-    priority: low            # dropped 2026-09-16 pending operator decision
+    downloaded: false        # ABANDONED 2026-09-16 by operator decision; 59 GiB of partials deleted.
+    # Why: the DFlash drafter (its main speed argument) is rejected by upstream master
+    # (issue #26669), issue #27899 reports CUDA NaN logits for some Laguna-S k-quant mixes on
+    # our backend, and every published score is vendor-only (no Artificial Analysis / DeepSWE /
+    # Toolathlon entry). Re-download with: llm pull laguna  (needs the poolside fork for DFlash).
     verified: true
 
   minimax-m2.7:

@@ -91,6 +91,21 @@ presets set). On-cluster agents can point at `http://gpu2260:4000` directly and 
 
 ## The gateway
 
+The gateway runs on a **login node** (`login009` by default), not on a compute node: it needs no
+GPU, it survives Slurm jobs ending, and it is where the Cloudflare connector already runs, so the
+tunnel origin can simply be `http://localhost:4000`. Peers default to `http://login009:4000`;
+override with `LLM_GATEWAY_HOST`, `LLM_GATEWAY_URL` (or `LLM_GATEWAY_URL=none` to not join one).
+
+```bash
+ssh login009 'cd /oscar/data/stellex/glvov/local-model-serve && bin/llm gateway up'
+```
+
+It is a single `uvicorn` process at `nice -n 5` that polls each peer's `/models` every 10 s — no
+busy loops. It lives in tmux session `llm-gateway` on that node and keeps running across jobs and
+logouts, but **not across a login-node reboot**: after one, re-run the command above. A user
+`@reboot` crontab entry would automate it (`crontab` is available on login009 and glvov has no
+crontab today) — check CCV policy before adding one, and do not install a systemd unit.
+
 ```bash
 llm passwd            # set the browser password (scrypt hash, 0600) - required before gateway up
 llm gateway up        # :4000, tmux 'llm-gateway'
