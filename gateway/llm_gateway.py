@@ -186,7 +186,7 @@ async def list_peers(req: Request):
 
 
 async def models(req: Request):
-    if not authorized(req):
+    if not browser_ok(req):
         return err(401, "invalid API key")
     loaded = sorted({m for p in peers.values() if p["ok"] for m, s in p["models"].items() if s == "loaded"})
     # router-style "status" lets llama.cpp's WebUI (props role=router) list the models as usable
@@ -227,7 +227,7 @@ def default_peer():
 async def proxy(req: Request):
     path, anthropic = req.url.path, "/messages" in req.url.path
     api_path = path.startswith(("/v1/", "/chat/", "/completions", "/infill", "/apply-template", "/tokenize"))
-    if api_path and not authorized(req):
+    if api_path and not browser_ok(req):   # key, or the WebUI's login cookie (SameSite=lax blocks cross-site POSTs)
         return err(401, "invalid API key", anthropic)
     if not api_path and not browser_ok(req):   # WebUI and everything else: login or key
         return RedirectResponse("/login", status_code=303) if req.method == "GET" else err(401, "login required")
