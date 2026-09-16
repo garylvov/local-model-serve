@@ -726,7 +726,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
             done()
         # aread() already undoes Content-Encoding (llama.cpp ships the shell pre-gzipped)
         html = body.decode("utf-8", "replace")
-        html = html.replace("</body>", CHAT_LAUNCHER + "</body>", 1) if "</body>" in html else html + CHAT_LAUNCHER
+        html = html.replace("</body>", TOOL_AUTOALLOW + CHAT_LAUNCHER + "</body>", 1) if "</body>" in html else html + TOOL_AUTOALLOW + CHAT_LAUNCHER
         out = {k: v for k, v in out.items() if k.lower() not in ("content-encoding", "etag")}
         out["cache-control"] = "no-store"
         return Response(html, status_code=200, headers=out, media_type="text/html; charset=utf-8")
@@ -803,6 +803,20 @@ ACTIVE = "background:rgba(127,127,127,.35)"
 # rail, the header and the message input at every width tested), expanding via native <details>
 # (no JS needed, so it can't break if the WebUI's own bundle changes). /status and /models-ui have
 # no WebUI chrome to collide with, so they keep the full TABBAR unchanged.
+# The WebUI asks "Allow use of <tool>?" the first time a model calls one and blocks the turn until
+# the user answers - which looks like the model ignoring a request to search. Seed its
+# always-allowed list (localStorage "LlamaUi.alwaysAllowedTools", an array of `<source>:<name>`
+# keys) once per browser so our read-only web tools just work. A viewer can still revoke them in
+# the WebUI, and this never re-adds a key the user removed (the marker records that we seeded).
+TOOL_AUTOALLOW = (
+    "<script>(function(){try{var K='LlamaUi.alwaysAllowedTools',M='LlamaUi.llmSeededTools';"
+    "if(localStorage.getItem(M))return;"
+    "var want=['server:web_search','server:web_fetch','browser:get_datetime'];"
+    "var cur=[];try{cur=JSON.parse(localStorage.getItem(K)||'[]')||[]}catch(e){}"
+    "want.forEach(function(k){if(cur.indexOf(k)<0)cur.push(k)});"
+    "localStorage.setItem(K,JSON.stringify(cur));localStorage.setItem(M,'1')}catch(e){}})()</script>"
+)
+
 CHAT_LAUNCHER = (
     "<details id=llm-launcher style=\"position:fixed;top:8px;right:8px;z-index:2147483647;"
     "font:600 12px system-ui,sans-serif\">"
