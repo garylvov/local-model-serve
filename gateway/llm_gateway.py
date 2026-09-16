@@ -645,6 +645,39 @@ def default_peer():
     return (local or ok or [None])[0]
 
 
+# Tools the gateway never exposes, whatever an MCP server offers. browser_run_code_unsafe runs code
+# in Playwright's Node.js process: outside the page sandbox and outside mcp/egress_proxy.py, so it
+# could read local files or reach private hosts.
+BLOCKED_TOOLS = ("run_code_unsafe", "webmcp_call")
+
+
+def tool_blocked(name: str) -> bool:
+    return any(b in (name or "") for b in BLOCKED_TOOLS)
+
+
+async def tools_endpoint(req: Request, raw: bytes):
+    """GET /tools: list minus blocked tools. POST /tools: refuse blocked tools, else forward."""
+    url = default_peer()
+    if not url:
+        return err(503, "no peer registered")
+    if req.method == "POST":
+        try:
+            name = (json.loads(raw or b"{}") or {}).get("tool", "")
+        except ValueError:
+            return err(400, "request body must be JSON")
+        if tool_blocked(name):
+            return err(403, f"tool '{name}' is disabled on this server")
+        return await forward(req, url, raw, False, False)
+    p = peers[url]
+    u, h, ext = await target(url, "/tools")
+    r = await client.get(u, headers=peer_headers(p) | h, timeout=15, extensions=ext)
+    try:
+        tools = [x for x in r.json() if not tool_blocked(x.get("tool", ""))]
+    except ValueError:
+        return err(502, "bad /tools response from peer")
+    return JSONResponse(tools, headers={"cache-control": "no-store"})
+
+
 async def proxy(req: Request):
     path, anthropic = req.url.path, "/messages" in req.url.path
     api_path = path.startswith(("/v1/", "/chat/", "/completions", "/infill", "/apply-template", "/tokenize"))
@@ -653,6 +686,8 @@ async def proxy(req: Request):
     if not api_path and not browser_ok(req):   # WebUI and everything else: login or key
         return RedirectResponse("/login", status_code=303) if req.method == "GET" else err(401, "login required")
     raw = await req.body()
+    if path == "/tools":
+        return await tools_endpoint(req, raw)
     body = {}
     if raw:
         try:
@@ -806,12 +841,14 @@ ACTIVE = "background:rgba(127,127,127,.35)"
 # The WebUI asks "Allow use of <tool>?" the first time a model calls one and blocks the turn until
 # the user answers - which looks like the model ignoring a request to search. Seed its
 # always-allowed list (localStorage "LlamaUi.alwaysAllowedTools", an array of `<source>:<name>`
-# keys) once per browser so our read-only web tools just work. A viewer can still revoke them in
+# keys) once per browser so the web and browser tools just work. browser_file_upload is deliberately
+# left out, as are run_code_unsafe (code in Playwright's Node process, outside the page) and
+# webmcp_call: those still ask. Bump the marker's version when the list changes. A viewer can still revoke them in
 # the WebUI, and this never re-adds a key the user removed (the marker records that we seeded).
 TOOL_AUTOALLOW = (
-    "<script>(function(){try{var K='LlamaUi.alwaysAllowedTools',M='LlamaUi.llmSeededTools';"
+    "<script>(function(){try{var K='LlamaUi.alwaysAllowedTools',M='LlamaUi.llmSeededTools.v2';"
     "if(localStorage.getItem(M))return;"
-    "var want=['server:web_search','server:web_fetch','browser:get_datetime'];"
+    "var want=['server:web_search','server:web_fetch','browser:get_datetime','server:browser_browser_close','server:browser_browser_resize','server:browser_browser_console_messages','server:browser_browser_handle_dialog','server:browser_browser_evaluate','server:browser_browser_drop','server:browser_browser_find','server:browser_browser_fill_form','server:browser_browser_press_key','server:browser_browser_type','server:browser_browser_navigate','server:browser_browser_navigate_back','server:browser_browser_network_requests','server:browser_browser_network_request','server:browser_browser_take_screenshot','server:browser_browser_snapshot','server:browser_browser_click','server:browser_browser_drag','server:browser_browser_hover','server:browser_browser_select_option','server:browser_browser_tabs','server:browser_browser_wait_for','server:browser_browser_webmcp_list'];"
     "var cur=[];try{cur=JSON.parse(localStorage.getItem(K)||'[]')||[]}catch(e){}"
     "want.forEach(function(k){if(cur.indexOf(k)<0)cur.push(k)});"
     "localStorage.setItem(K,JSON.stringify(cur));localStorage.setItem(M,'1')}catch(e){}})()</script>"
