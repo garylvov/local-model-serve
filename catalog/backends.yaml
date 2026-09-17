@@ -51,6 +51,23 @@ backends:
     models_endpoint: /v1/models     # OpenAI schema {data:[{id}]}; adapter fills status:"loaded"
     port_base: 8100
     venv: vendor/vllm-venv           # uv venv; gitignored. `uv venv vendor/vllm-venv && uv pip install -p vendor/vllm-venv/bin/python vllm`
+    # MEASURED 2026-09-17 on gpu2260 (driver 575.57.08, CUDA 12.9, RTX A5000 sm_86):
+    #  * plain `uv pip install vllm` pulls vllm==0.29.0 with torch==2.13.0+cu130, which needs a
+    #    driver new enough for CUDA 13 - ours only supports up to CUDA 12.9, so the engine crashes
+    #    at startup: "RuntimeError: The NVIDIA driver on your system is too old (found version
+    #    12090)." Pin `uv pip install vllm==0.9.2` instead (torch==2.7.0+cu126, works with this
+    #    driver) - transformers still resolves to a too-new 5.17.0 that vllm 0.9.2's Ovis config
+    #    conflicts with ("ValueError: 'aimv2' is already used by a Transformers config"); pin
+    #    `transformers==4.51.3` on top. Also needs `ninja` in the same venv (vLLM shells out to it
+    #    for its Triton/inductor JIT; PATH must include `{venv}/bin`) and
+    #    `--gpu-memory-utilization` sized to the GPU's ACTUAL free VRAM, not its total (vLLM's own
+    #    check: "Free memory on device (8.42/22.06 GiB) ... is less than desired ...").
+    #  * Served Qwen/Qwen2.5-0.5B-Instruct (BF16 safetensors) on GPU7 (deepseek-v4-flash was using
+    #    all 8 GPUs, ~9 GiB free on GPU7): weights loaded 0.61 s, full engine init (profile + KV
+    #    cache + CUDA graph capture) 157.45 s, 85 tok/s single-stream decode (150 tokens / 1.755 s),
+    #    7.3 GiB VRAM at --gpu-memory-utilization 0.3. Automatic prefix caching (V1 default) HIT:
+    #    two chat requests sharing a ~4046-token prefix logged "Prefix cache hit rate: 49.8%" and
+    #    the second request's wall time dropped from 0.205 s to 0.129 s.
     cmd: >-
       {venv}/bin/vllm serve {repo}
       --port {port}
@@ -68,7 +85,7 @@ backends:
       quant_selection: "repo id only - vLLM prefers safetensors (bf16/fp8/awq/gptq); GGUF is experimental/unsupported for most archs"
       speculative: "--speculative-config '<json>' (spec_json, built from spec-draft-model + num_speculative_tokens)"
       mmproj: "none - vLLM loads the vision tower from the model repo itself, no separate mmproj flag"
-      prefix_caching: "automatic (V1 default, --no-enable-prefix-caching to disable) - works for text AND images (measured 2026-09-17)"
+      prefix_caching: "automatic (V1 default, --no-enable-prefix-caching to disable) - text HIT confirmed (measured 2026-09-17: 49.8% hit rate, second-request latency 0.205s -> 0.129s over a shared 4046-token prefix); image prefix reuse not tested here"
     build: {script: null, note: "uv venv + uv pip install vllm; needs CUDA on PATH (module cuda/12.9.0-cinr here)"}
 
   dwarfstar:
@@ -80,8 +97,19 @@ backends:
     build:
       repo: https://github.com/antirez/ds4
       dir: vendor/ds4
-      script: scripts/build-ds4.sh   # `make cuda` (or the target its docs/ name for this GPU) in vendor/ds4
-      note: "README calls out Ada Lovelace / DGX Spark explicitly; Ampere sm_86 (our A5000s) unconfirmed until built here"
+      cmd: "make ds4-server CUDA_ARCH=sm_86"   # the Makefile takes an explicit -arch; sm_86 = Ampere (our A5000s)
+      status: |
+        MEASURED 2026-09-17 on gpu2260: `make ds4-server CUDA_ARCH=sm_86` BUILT CLEANLY in 3m54.6s
+        (nvcc -arch=sm_86, no errors/warnings of note) - the README only calls out Ada Lovelace/L40S
+        and DGX Spark explicitly, but the Makefile's CUDA_ARCH is a generic nvcc -arch value and
+        Ampere sm_86 built fine. `./ds4-server --help` runs. NOT run against real weights: ds4 uses
+        its own GGUF variants (antirez/deepseek-v4-gguf), not llama.cpp's unsloth GGUFs already on
+        disk here, and the smallest one (DeepSeek-V4-Flash-IQ2XXS..., ds4f-q2) is 80.76 GiB per the
+        HF tree API (checked 2026-09-17) - not downloaded without the operator's go-ahead. All other
+        variants are larger (Q4 153 GiB, MXFP4 145 GiB, up to Pro at 432-826 GiB combined shards).
+        GPU7 (the only GPU with meaningful free VRAM while deepseek-v4-flash occupies all 8) had
+        ~9 GiB free, not enough for even the Q2 quant, so a live serve test needs either the
+        deepseek-v4-flash lane freed or ~90+ GiB of free VRAM elsewhere - operator decision.
     cmd: >-
       {bin}/ds4-server
       --model {model_path}

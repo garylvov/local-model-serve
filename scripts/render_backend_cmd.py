@@ -48,7 +48,7 @@ def main():
 
     def unsupported(cap):
         v = str(supports.get(cap, "")).strip().lower()
-        return v in ("", "unknown") or v.startswith("unsupported")
+        return v == "" or v.startswith(("unknown", "unsupported"))
 
     repo_full = g.get("hf-repo", "")
     repo, _, quant = repo_full.partition(":")
@@ -64,9 +64,12 @@ def main():
     if spec_model and unsupported("speculative"):
         fail(f"{backend} does not support speculative decoding (section [{section}] sets spec-draft-model={spec_model}); "
              f"drop spec-draft-* for this section, or choose an engine whose backends.yaml lists a 'speculative' mechanism")
-    mmproj_set = g.get("mmproj") or (g.get("no-mmproj", "false") != "true" and "vision" in section)
-    if mmproj_set and unsupported("mmproj"):
-        fail(f"{backend} has no mmproj/multimodal support (section [{section}] wants one): {supports.get('mmproj', 'not documented')}")
+    # Only an explicit `mmproj =` (a separate projector file, llama.cpp's convention) is checked
+    # here - naming a section "...vision..." is not by itself a request for a *separate* mmproj
+    # flag, since an engine like vLLM loads its vision tower from the model repo automatically.
+    if g.get("mmproj") and unsupported("mmproj"):
+        fail(f"{backend} has no mmproj/multimodal support (section [{section}] sets mmproj={g['mmproj']}): "
+             f"{supports.get('mmproj', 'not documented')}")
 
     device = g.get("device", "")
     gpu_ids = [d[4:] for d in device.split(",") if d.startswith("CUDA") and d[4:].isdigit()]
