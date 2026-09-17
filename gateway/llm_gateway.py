@@ -637,10 +637,10 @@ def pick(model: str, sess):
         # copies on one machine it would send every concurrent request to the same copy.
         url, mid = min(ready, key=lambda c: (inflight_by_replica.get(c, 0), peers[c[0]]["inflight"]))
     else:
-        loadable = [(u, m) for u, m, _ in cands]
-        if not loadable:
-            return None, None, False
-        url, mid = min(loadable, key=lambda c: sum(s == "loaded" for s in peers[c[0]]["models"].values()))
+        # Not loaded anywhere: do NOT ask a router to auto-load it. That path uses llama.cpp's
+        # one-thread reader with no pre-warm (minutes for a big cold model) and can evict whatever
+        # else is loaded. Loading is an explicit action (Models page / `llm up`).
+        return None, None, False
     if sess:
         pins[(sess, model)] = ((url, mid), time.time())
     return url, mid, (url, mid) not in ready
@@ -695,6 +695,23 @@ async def proxy(req: Request):
     raw = await req.body()
     if path == "/tools":
         return await tools_endpoint(req, raw)
+    if path in ("/models/load", "/models/unload"):
+        # The chat UI auto-loads whatever model is picked in its dropdown, straight on the router:
+        # no pre-warm, no confirmation, and it can replace a model someone is using. Loading and
+        # unloading only happen from the Models page (queued to the machine's `llm up`/`llm down`).
+        try:
+            want = (json.loads(raw or b"{}") or {}).get("model", "")
+        except ValueError:
+            want = ""
+        states = {m: s for pp in peers.values() if pp["ok"] for m, s in pp["models"].items()
+                  if m == want or base_name(m) == want}
+        if any(s == "loaded" for s in states.values()):
+            msg = f"{want} is already loaded; nothing to do"
+        elif any(s == "loading" for s in states.values()):
+            msg = f"{want} is loading right now; wait for it to finish"
+        else:
+            msg = f"{want or 'that model'} is not loaded. Load it from the Models page, which pre-warms the weights and asks before replacing a running model"
+        return err(409, msg)
     body = {}
     if raw:
         try:
@@ -712,8 +729,8 @@ async def proxy(req: Request):
     if not url:
         known = any(base_name(m) == model or m == model for p in peers.values() for m in p["models"])
         return err(503 if known else 404,
-                   f"model '{model}' is " + ("on no healthy peer" if known else
-                                             "not loaded; load it from the Models tab"), anthropic)
+                   f"model '{model}' is " + ("not loaded; load it from the Models page" if known else
+                                             "not served by any machine"), anthropic)
     if mid != model and isinstance(body, dict):   # replica chosen: address the concrete instance
         raw = json.dumps({**body, "model": mid}).encode()
     return await forward(req, url, raw, autoload, anthropic, mid if mid != model else None)

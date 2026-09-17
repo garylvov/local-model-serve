@@ -148,6 +148,16 @@ cmd_serve() {
     say "web tools disabled: create the venv first (uv venv mcp/.venv && uv pip install -p mcp/.venv/bin/python httpx ddgs)"
   fi
   say "preset $(basename "$p") ($(gpu_count) GPUs), models: $(sections | tr '\n' ' ')"
+  # The router loads load-on-startup models itself, with llama.cpp's one-thread reader: warm their
+  # weights in parallel first (all models at once) so startup reads from RAM, not the network.
+  if [[ -z "${LLM_NO_PREWARM:-}" ]]; then
+    local sec pids=()
+    for sec in $(sections); do
+      [[ "$(ini_get "$sec" load-on-startup)" == true ]] || continue
+      python3 "$ROOT/scripts/weights_cache.py" warm "$(ini_get "$sec" hf-repo)" --min-gib 0 & pids+=($!)
+    done
+    (( ${#pids[@]} )) && { say "pre-warming ${#pids[@]} startup model(s) in parallel"; wait "${pids[@]}" || true; }
+  fi
   tmux new-session -d -s "$SESSION" -c "$ROOT" -e "LLAMA_CACHE=$LLAMA_CACHE" \
     "exec '$BIN/llama-server' --models-preset '$p' --no-models-autoload --models-max ${LLM_MODELS_MAX:-8} $mcp \
        --host 0.0.0.0 --port $PORT --api-key-file '$KEYFILE' >> '$RUN/router.log' 2>&1"
@@ -243,6 +253,7 @@ for sec in cp.sections():
         "no_mmproj": g.get("no-mmproj", "false") == "true",
         "load_on_startup": g.get("load-on-startup", "false") == "true",
         "build": g.get("build") or "master",   # which catalog/builds.yaml variant this section needs
+        "backend": g.get("backend") or "llamacpp",   # catalog/backends.yaml: which engine serves this section
         "spec_type": g.get("spec-type"), "spec_model": g.get("model-draft"),
         "downloaded": present, "downloaded_gib": size_gib,
     }
@@ -287,6 +298,29 @@ apply_commands() { # apply_commands <heartbeat-response-json>
     results="$(jq -c --arg id "$id" --argjson ok "$ok" --arg msg "$msg" '. + [{id: $id, ok: $ok, msg: $msg}]' <<<"$results")"
   done
   [[ "$n" -gt 0 ]] && echo "$results" > "$RESULTS"
+}
+
+cache_janitor() { # evict page cache of preset weights nobody reads: unloaded models, and loaded models
+  # that are fully on GPU. Keeps: models loading/downloading, and CPU-offloaded models (n-cpu-moe /
+  # cpu-moe) that page their weights from this cache on every token. At most once a minute.
+  [[ -n "${LLM_KEEP_CACHE:-}" ]] && return 0
+  local stamp="$RUN/janitor.ts" now; now=$(date +%s)
+  [[ -f "$stamp" ]] && (( now - $(cat "$stamp") < 60 )) && return 0
+  echo "$now" > "$stamp"
+  local states; states="$(api GET /models 2>/dev/null | jq -r '.data[] | "\(.id) \(.status.value)"' 2>/dev/null)" || return 0
+  local keep_repos="" sec st repo
+  while read -r sec st; do
+    [[ -n "$sec" ]] || continue
+    repo="$(ini_get "$sec" hf-repo 2>/dev/null)"; [[ -n "$repo" ]] || continue
+    if [[ "$st" == loading || "$st" == downloading ]] || { [[ "$st" == loaded ]] && [[ -n "$(ini_get "$sec" n-cpu-moe)$(ini_get "$sec" cpu-moe)" ]]; }; then
+      keep_repos+="$repo"$'\n'
+    fi
+  done <<<"$states"
+  for sec in $(sections); do
+    repo="$(ini_get "$sec" hf-repo)"; [[ -n "$repo" ]] || continue
+    grep -qxF -- "$repo" <<<"$keep_repos" && continue
+    python3 "$ROOT/scripts/weights_cache.py" evict "$repo" >/dev/null 2>&1 || true
+  done
 }
 
 peer_url() { # what the gateway should call back on
@@ -350,15 +384,68 @@ cmd_gateway() {
 
 cmd_stop() { heartbeat stop; running && tmux send-keys 2>/dev/null -t "=$SESSION" C-c && sleep 5; running && tmux kill-session -t "=$SESSION"; say "router stopped"; }
 
+# ---- backend abstraction (catalog/backends.yaml): default backend is llamacpp, served by the
+# router above exactly as before. A section with `backend = vllm|dwarfstar|...` instead runs as
+# its own process on its own port, fronted by gateway/backend_adapter.py, which registers with the
+# gateway as an ordinary peer (same /peers/register call bin/llm already makes for the router).
+BACKENDS="$ROOT/catalog/backends.yaml"
+backend_of() { local b; b="$(ini_get "$1" backend)"; echo "${b:-llamacpp}"; }
+engine_sess() { echo "llm-eng-$1"; }
+engine_port() { # engine_port <section> <backend> : port_base from backends.yaml + stable offset
+  local base off
+  base="$(awk -v b="$2" '$0 ~ "^  "b":" {f=1} f && /port_base:/ {print $2; exit}' "$BACKENDS")"
+  [[ -n "$base" ]] || die "backend '$2' has no port_base in $BACKENDS"
+  off=$(( $(echo -n "$1" | cksum | cut -d' ' -f1) % 50 ))
+  echo $(( base + off ))
+}
+
+engine_up() { # engine_up <section> <backend> : render, launch engine+adapter in one tmux session, wait healthy
+  local m="$1" b="$2" port sess out err_msg cmd cwd adapter_port health envargs=()
+  port="$(engine_port "$m" "$b")"; sess="$(engine_sess "$m")"
+  out="$(python3 "$ROOT/scripts/render_backend_cmd.py" "$(preset)" "$m" "$BACKENDS" "$ROOT" "$port" 2>&1)" \
+    || { err_msg="$(jq -r '.error // empty' <<<"$out" 2>/dev/null)"; die "${err_msg:-$out}"; }
+  cmd="$(jq -r .cmd <<<"$out")"; cwd="$(jq -r .cwd <<<"$out")"
+  adapter_port="$(jq -r .adapter_port <<<"$out")"; health="$(jq -r .health_endpoint <<<"$out")"
+  while IFS='=' read -r k v; do [[ -n "$k" ]] && envargs+=(--env "$k=$v"); done \
+    < <(jq -r '.env | to_entries[]? | "\(.key)=\(.value)"' <<<"$out")
+  tmux kill-session -t "=$sess" 2>/dev/null || true
+  say "starting $m ($b): $cmd"
+  tmux new-session -d -s "$sess" -c "$cwd" \
+    "exec python3 '$ROOT/gateway/backend_adapter.py' --cmd '$cmd' --cwd '$cwd' --engine-port $port \
+       --listen-port $adapter_port --model-id '$m' --health-path '$health' \
+       --gateway-url '$LLM_GATEWAY_URL' --key-file '$KEYFILE' ${envargs[*]} >> '$RUN/$sess.log' 2>&1"
+  say "$m ($b): engine on :$port, adapter (gateway peer) on :$adapter_port; waiting for health ..."
+  local t0=$SECONDS
+  until curl -sf --max-time 3 "http://127.0.0.1:$adapter_port/health" >/dev/null 2>&1; do
+    tmux has-session -t "=$sess" 2>/dev/null || die "$sess exited before becoming healthy; see $RUN/$sess.log"
+    (( SECONDS - t0 > ${LLM_LOAD_TIMEOUT:-1800} )) && die "$m ($b) not healthy after $((SECONDS - t0))s; see $RUN/$sess.log"
+    sleep 3
+  done
+  say "$m ($b): healthy after $((SECONDS - t0))s (tmux '$sess', log $RUN/$sess.log)"
+}
+
+engine_down() { # engine_down <section> <backend> : stop the tmux session, deregister its adapter peer
+  local m="$1" b="$2" sess port adapter_port
+  sess="$(engine_sess "$m")"; port="$(engine_port "$m" "$b")"; adapter_port=$((port + 900))
+  if tmux has-session -t "=$sess" 2>/dev/null; then
+    printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS --max-time 10 -K - -X POST \
+      -H 'Content-Type: application/json' "${LLM_GATEWAY_URL%/}/peers/deregister" \
+      --data "{\"url\":\"http://$HOST:$adapter_port\"}" >/dev/null 2>&1 || true
+    tmux kill-session -t "=$sess"
+  fi
+  say "$m ($b): stopped"
+}
+
 cmd_up() {
   [[ $# -ge 1 ]] || die "usage: llm up <model>..."
   running || cmd_serve
-  local m
+  local m b
   for arg in "$@"; do
-    m="$(resolve "$arg")"
+    m="$(resolve "$arg")"; b="$(backend_of "$m")"
+    if [[ "$b" != llamacpp ]]; then engine_up "$m" "$b"; continue; fi
     # Large models: fill the page cache in parallel first; llama.cpp's own reader is one thread.
     [[ -n "${LLM_NO_PREWARM:-}" ]] || python3 "$ROOT/scripts/weights_cache.py" warm "$(ini_get "$m" hf-repo)" \
-      --min-gib "${LLM_PREWARM_MIN_GIB:-32}" || true
+      --min-gib "${LLM_PREWARM_MIN_GIB:-0}" || true
     say "loading $m ($(ini_get "$m" hf-repo) on $(ini_get "$m" device))"
     api POST /models/load "{\"model\":\"$m\"}" | jq -c .
     wait_status "$m" loaded "${LLM_LOAD_TIMEOUT:-1800}"
@@ -372,9 +459,10 @@ cmd_up() {
 
 cmd_down() {
   [[ $# -ge 1 ]] || die "usage: llm down <model>..."
-  local m
+  local m b
   for arg in "$@"; do
-    m="$(resolve "$arg")"
+    m="$(resolve "$arg")"; b="$(backend_of "$m")"
+    if [[ "$b" != llamacpp ]]; then engine_down "$m" "$b"; continue; fi
     api POST /models/unload "{\"model\":\"$m\"}" | jq -c .
     wait_status "$m" unloaded 120
     # Release its weights from the page cache too, unless another loaded copy still uses them.
@@ -408,13 +496,26 @@ cmd_resume() {
 
 cmd_ls() {
   healthy || die "router not running on $URL (llm serve)"
-  printf '%-22s %-10s %-42s %-24s %s\n' MODEL STATUS SOURCE DEVICES "DECODE tok/s (avg)"
+  printf '%-22s %-9s %-10s %-42s %-24s %s\n' MODEL BACKEND STATUS SOURCE DEVICES "DECODE tok/s (avg)"
   api GET /models | jq -r '.data[] | [.id, .status.value] | @tsv' | while IFS=$'\t' read -r id st; do
     local tps="-"
     if [[ "$st" == loaded ]]; then
       tps="$(api GET "/metrics?model=$id" 2>/dev/null | awk '/^llamacpp:predicted_tokens_seconds /{printf "%.1f", $2}')"
     fi
-    printf '%-22s %-10s %-42s %-24s %s\n' "$id" "$st" "$(ini_get "$id" hf-repo)" "$(ini_get "$id" device)" "${tps:--}"
+    printf '%-22s %-9s %-10s %-42s %-24s %s\n' "$id" llamacpp "$st" "$(ini_get "$id" hf-repo)" "$(ini_get "$id" device)" "${tps:--}"
+  done
+  # Non-llamacpp backends run as their own process, not part of the router above: list them from
+  # this machine's tmux sessions (llm-eng-<section>) + their adapter's /health, one row each.
+  local sec b port adapter_port st
+  for sec in $(sections); do
+    b="$(backend_of "$sec")"; [[ "$b" == llamacpp ]] && continue
+    port="$(engine_port "$sec" "$b")"; adapter_port=$((port + 900))
+    if tmux has-session -t "=$(engine_sess "$sec")" 2>/dev/null; then
+      curl -sf --max-time 3 "http://127.0.0.1:$adapter_port/health" >/dev/null 2>&1 && st=loaded || st=starting
+    else
+      st=unloaded
+    fi
+    printf '%-22s %-9s %-10s %-42s %-24s %s\n' "$sec" "$b" "$st" "$(ini_get "$sec" hf-repo)" "$(ini_get "$sec" device)" -
   done
 }
 
@@ -543,7 +644,7 @@ usage() { sed -n '2,3p' "$0"; echo "usage: llm serve|stop|up|down|pause|resume|l
 cmd="${1:-}"; shift || true
 case "$cmd" in
   serve|stop|up|down|pause|resume|ls|pull|tunnel|join|auth|gateway|passwd|build|builds|leave) "cmd_$cmd" "$@" ;;
-  _beat) resp="$(gw_post /peers/register)"; echo "$resp"; apply_commands "$resp" ;;
+  _beat) resp="$(gw_post /peers/register)"; echo "$resp"; apply_commands "$resp"; cache_janitor ;;
   preset) preset ;;
   _presetjson) preset_json ;;
   _disk) disk_free_gib; echo ;;

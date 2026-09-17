@@ -1,0 +1,104 @@
+# Backend catalog: how to launch a model-serving ENGINE, independent of which model it serves.
+# A preset section names one with `backend = <name>` (default: llamacpp, so every existing preset
+# is unchanged). Contract modeled on llama-swap: an opaque `cmd:` template + `checkEndpoint`, so a
+# brand-new engine can be added here without touching bin/llm.
+#
+# Template variables available to `cmd` (Python str.format style, {name}):
+#   port            - port this engine instance listens on (see `port_base` below)
+#   model_path      - local weights path/repo, exactly as given (repo, repo:quant, or a file path)
+#   repo            - HF repo id alone (repo split off ":quant" if present)
+#   quant           - quant/variant tag if the preset's `hf-repo` had one (repo:quant), else empty
+#   gpu_ids         - comma-separated CUDA indices, e.g. "0,1" (from `device = CUDA0,CUDA1`)
+#   gpu_count       - number of GPU indices
+#   ctx_size        - context length (preset `ctx-size`, default from typed field below)
+#   parallel        - concurrent slots / requests (preset `parallel`)
+#   models_dir      - local weights cache dir ($LLAMA_CACHE / models/)
+#   extra_args      - raw passthrough string from preset `extra-args` (escape hatch, see below)
+#   mmproj_path     - multimodal projector path/repo, if the engine supports one and it was set
+#   spec_model      - draft/speculative model path/repo, if the engine supports one and it was set
+#   spec_json       - engine-specific JSON blob for speculative config (vLLM), built from
+#                     spec_model/spec-draft-* fields when the engine declares `speculative: json`
+#
+# Typed fields a preset section may set, mapped per engine below (unsupported ones are a launch
+# error, not a silently dropped flag - see bin/llm's `render_backend_cmd`):
+#   device (GPU placement), ctx-size, parallel, hf-repo (repo[:quant]), mmproj / no-mmproj,
+#   spec-draft-hf / spec-draft-model / spec-type (draft/speculative model)
+# `extra_args = --foo bar --baz` on a section is passed through untouched by every engine.
+
+backends:
+  llamacpp:
+    # Baseline: unchanged from before this file existed. bin/llm never renders a `cmd` for this one
+    # -- llama.cpp's own router (llama-server --models-preset) owns process lifecycle, multiple
+    # models per port, on-demand load/unload, and the /models status schema the gateway already
+    # polls. Kept here so `llm ls` and docs have one place that lists every backend's capabilities.
+    kind: router                # one shared process serves many models (see presets/*.ini)
+    health_endpoint: /health
+    models_endpoint: /models    # native schema: {data:[{id, status:{value}}]}; gateway understands it directly
+    port_base: 8080
+    supports: {gpu_placement: "--device CUDA0,CUDA1,...", context_size: "--ctx-size", parallel: "--parallel",
+               quant_selection: "hf-repo:quant (llama.cpp -hf resolves the GGUF)", speculative: "spec-* flags (draft-mtp/draft)",
+               mmproj: "-hf repo auto-picks mmproj, or --mmproj-url", prefix_caching: "text only - logs 'cache_reuse is not supported by multimodal' for images"}
+    build:
+      script: scripts/build-llama.sh
+      note: "see catalog/builds.yaml for variants (master / poolside-laguna / glm53 / qwen-mtp)"
+
+  vllm:
+    # One process per model (vLLM has no multi-model router). Each instance gets its own port and
+    # registers with the gateway through gateway/backend_adapter.py (translates /models to the
+    # schema above and proxies everything else straight through).
+    kind: single-model
+    health_endpoint: /health
+    models_endpoint: /v1/models     # OpenAI schema {data:[{id}]}; adapter fills status:"loaded"
+    port_base: 8100
+    venv: vendor/vllm-venv           # uv venv; gitignored. `uv venv vendor/vllm-venv && uv pip install -p vendor/vllm-venv/bin/python vllm`
+    cmd: >-
+      {venv}/bin/vllm serve {repo}
+      --port {port}
+      --served-model-name {model_id}
+      --max-model-len {ctx_size}
+      --gpu-memory-utilization {gpu_mem_util}
+      {tp_flag}
+      {spec_flag}
+      {extra_args}
+    env: {CUDA_VISIBLE_DEVICES: "{gpu_ids}"}
+    supports:
+      gpu_placement: "CUDA_VISIBLE_DEVICES + --tensor-parallel-size (tp_flag, derived from gpu_count)"
+      context_size: "--max-model-len"
+      parallel: "implicit (vLLM's own continuous batching); no separate flag needed"
+      quant_selection: "repo id only - vLLM prefers safetensors (bf16/fp8/awq/gptq); GGUF is experimental/unsupported for most archs"
+      speculative: "--speculative-config '<json>' (spec_json, built from spec-draft-model + num_speculative_tokens)"
+      mmproj: "none - vLLM loads the vision tower from the model repo itself, no separate mmproj flag"
+      prefix_caching: "automatic (V1 default, --no-enable-prefix-caching to disable) - works for text AND images (measured 2026-09-17)"
+    build: {script: null, note: "uv venv + uv pip install vllm; needs CUDA on PATH (module cuda/12.9.0-cinr here)"}
+
+  dwarfstar:
+    # antirez/ds4 (MIT, C). ds4-server: OpenAI-compatible API, one process per model like vLLM.
+    kind: single-model
+    health_endpoint: /health
+    models_endpoint: /v1/models
+    port_base: 8200
+    build:
+      repo: https://github.com/antirez/ds4
+      dir: vendor/ds4
+      script: scripts/build-ds4.sh   # `make cuda` (or the target its docs/ name for this GPU) in vendor/ds4
+      note: "README calls out Ada Lovelace / DGX Spark explicitly; Ampere sm_86 (our A5000s) unconfirmed until built here"
+    cmd: >-
+      {bin}/ds4-server
+      --model {model_path}
+      --port {port}
+      --ctx-size {ctx_size}
+      {extra_args}
+    env: {CUDA_VISIBLE_DEVICES: "{gpu_ids}"}
+    supports:
+      gpu_placement: "CUDA_VISIBLE_DEVICES (single-GPU per docs at last check; verify against build)"
+      context_size: "--ctx-size"
+      parallel: "unknown - check ds4-server --help after building"
+      quant_selection: "ds4's own weight format, not GGUF - needs a converted/quantized ds4 checkpoint"
+      speculative: "unknown - not documented as of 2026-09-17"
+      mmproj: "unsupported (text-only engine)"
+      prefix_caching: "unknown - not documented as of 2026-09-17"
+
+# Reject-at-launch rules bin/llm enforces before rendering `cmd` (see render_backend_cmd):
+#   - spec-draft-* set but the engine's `supports.speculative` is missing/"unknown" -> error
+#   - mmproj set (or hf-repo implies one) but the engine's `supports.mmproj` is "unsupported"/missing -> error
+#   - hf-repo names a GGUF (":Q4_..." etc.) for an engine whose quant_selection says GGUF is unsupported -> error, with the exact repo/quant in the message

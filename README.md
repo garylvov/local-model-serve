@@ -162,6 +162,60 @@ not enabled.
 
 </details>
 
+## Backends
+
+<details>
+<summary><b>Serving a model with something other than llama.cpp (vLLM, DwarfStar, ...)</b></summary>
+
+Every model is served by a **backend**: an engine process that answers OpenAI-compatible requests.
+[`catalog/backends.yaml`](catalog/backends.yaml) lists the ones this repo knows about. A preset
+section names one with `backend = <name>`; leaving it out means `backend = llamacpp`, so every
+preset written before this feature existed is unchanged.
+
+```ini
+[qwen-small-vllm]
+backend = vllm
+hf-repo = Qwen/Qwen2.5-0.5B-Instruct
+device = CUDA7
+ctx-size = 4096
+parallel = 1
+```
+
+- **`backend = llamacpp`** (default): served by the shared llama-server router exactly as before
+  (`presets/*.ini`, `llm serve`/`up`/`down`). One process, many models, on-demand load/unload.
+- **any other backend**: `llm up <model>` starts that engine as its **own process on its own
+  port**, in front of a small adapter (`gateway/backend_adapter.py`) that translates its `/models`
+  (or `/v1/models`) response into the shape the gateway already polls
+  (`{"data":[{"id", "status":{"value":"loaded"}}]}`) and proxies every other request straight
+  through. The adapter heartbeats itself to the gateway's `POST /peers/register` — the same call
+  `bin/llm` makes for the router — so the gateway treats it as an ordinary peer and routes to it by
+  model name. `llm ls` shows a BACKEND column and merges these processes into the same table;
+  `llm down <model>` stops the engine and deregisters it.
+
+**Adding a new engine** needs no code if it's already OpenAI-compatible: add an entry to
+`catalog/backends.yaml` with a `cmd:` template (llama-swap's contract - opaque command string +
+`checkEndpoint`) and a `port_base`. Template variables: `port`, `model_path`, `repo`, `quant`,
+`gpu_ids`, `gpu_count`, `ctx_size`, `parallel`, `models_dir`, `extra_args`, `mmproj_path`,
+`spec_model`, `spec_json`. A few typed fields are mapped per engine rather than left as raw flags,
+because they need translation, not just formatting:
+
+| Typed field | llama.cpp | vLLM | DwarfStar |
+| --- | --- | --- | --- |
+| GPU placement | `--device CUDA0,CUDA1,...` | `CUDA_VISIBLE_DEVICES` + `--tensor-parallel-size` | `CUDA_VISIBLE_DEVICES` |
+| context size | `--ctx-size` | `--max-model-len` | `--ctx-size` |
+| parallel/concurrency | `--parallel` | implicit (continuous batching) | not yet measured |
+| quant selection | `-hf repo:quant` (GGUF) | repo id only (safetensors bf16/fp8/awq/gptq; GGUF unsupported for most archs) | its own GGUF variant, not llama.cpp's |
+| draft/speculative model | `spec-*` flags (`draft-mtp`/`draft`) | `--speculative-config '<json>'` | not documented |
+| multimodal projector | `-hf` auto-picks mmproj, or `--mmproj-url` | none - vision tower loads from the model repo | unsupported (text-only) |
+| prefix caching | text only - llama.cpp logs `cache_reuse is not supported by multimodal` for images | automatic (V1 default); text measured working | unknown |
+
+Anything else goes through `extra_args = --foo bar` untouched. `scripts/render_backend_cmd.py`
+**rejects an unsupported combination at launch** (e.g. `spec-draft-model` set on an engine whose
+`supports.speculative` is missing/`unknown`, or an mmproj on a text-only engine) with the exact
+section and flag named, instead of silently dropping it.
+
+</details>
+
 ## Commands
 
 <details>

@@ -22,3 +22,4 @@ __pycache__/
 /mcp/.npm/
 /.playwright-mcp/
 !config.example.env
+/harness/dsh/
