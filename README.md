@@ -29,6 +29,31 @@ export OPENAI_API_KEY=$LLM_API_KEY                     ANTHROPIC_AUTH_TOKEN=$LLM
 
 Everything below is optional: more machines, a scheduler, a public URL.
 
+## What it downloads, and where
+
+`bin/llm local` writes everything inside the repo directory, plus a small config directory. Nothing
+is sent anywhere: weights come from Hugging Face, and requests stay on the machine.
+
+| Path | What | Size |
+| --- | --- | --- |
+| `vendor/llama.cpp/` | llama.cpp source + CUDA build (first run only, a few minutes) | ~2 GB |
+| `models/` | model weights (GGUF), in llama.cpp's own cache layout (`LLAMA_CACHE`) | as big as the models |
+| `run/<host>/` | logs, PIDs, the preset in use | small |
+| `~/.config/local-model-serve/` | `api-key`, `auth.env` (client key + URL), `passwd` (scrypt hash) | tiny, mode 0600 |
+
+**Which weights.** `bin/llm` picks a preset from the GPU count (`presets/single-24g.ini` for one
+GPU, `dual-24g`, `quad-24g`, `8x-24g`), and each section names a Hugging Face repo and quant, for
+example `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` (16.4 GiB) on a single 24 GB GPU. Only models marked
+`load-on-startup` are fetched at first run; the rest download on `llm up <model>` or from the
+**Models** page (which shows the size and asks first). `llm pull <model>` downloads without loading.
+
+**Moving the weights:** set `LLM_MODELS_DIR=/somewhere/big` (or `models/` can be a symlink). Disk
+is the main thing to plan: a 24 GB-GPU model is ~16 GiB, a 180 GiB-VRAM model is ~127 GiB, and the
+big MoE experiments here have run to 800 GiB.
+
+**Cleaning up:** `llm down <model>` also drops that model's pages from the OS page cache;
+weights stay on disk until you delete them from `models/`.
+
 ## Setups
 
 <details>
