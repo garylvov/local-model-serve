@@ -1,47 +1,52 @@
 # local-model-serve
 
-Serve local LLMs with [llama.cpp](https://github.com/ggml-org/llama.cpp) from one or many GPU
-machines behind a single OpenAI- and Anthropic-compatible endpoint, with a browser chat, live
-hardware view, and web tools.
+Run local LLMs behind one OpenAI- and Anthropic-compatible endpoint, with a browser chat, a live
+hardware view and web tools. One command on one machine; the same repo scales to several machines,
+a Slurm cluster and a public URL when you want it.
 
 ```
-clients ──> gateway (:4000) ──> llama-server router (:8080) on each machine ──> one process per model
+clients ──> gateway (:4000) ──> engine on each machine ──> one process per model
+                                llama.cpp (default), vLLM, DwarfStar
 ```
-
-Machines register themselves with the gateway; clients only ever talk to the gateway.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/garylvov/local-model-serve && cd local-model-serve
-cp config.example.env config.env      # optional: public URL, gateway host, Cloudflare zone
-bin/llm join                          # build llama.cpp, start the router, load the preset's models
-bin/llm ls                            # what is loaded, on which GPUs, how fast
+bin/llm local          # build llama.cpp, start the router + gateway on 127.0.0.1, print the URL
 ```
 
-The API key is written to `~/.config/local-model-serve/auth.env`. Point any OpenAI or Anthropic
-client at the gateway with it:
+Open `http://127.0.0.1:4000`: chat, a live **Hardware** page and a **Models** page (load, unload,
+GPU placement). Nothing is exposed off the machine; a browser password is generated on first run.
+
+Point any OpenAI or Anthropic client at the same address, with the key from
+`~/.config/local-model-serve/auth.env`:
 
 ```bash
-export OPENAI_BASE_URL=http://<gateway>:4000/v1        ANTHROPIC_BASE_URL=http://<gateway>:4000
+export OPENAI_BASE_URL=http://127.0.0.1:4000/v1        ANTHROPIC_BASE_URL=http://127.0.0.1:4000
 export OPENAI_API_KEY=$LLM_API_KEY                     ANTHROPIC_AUTH_TOKEN=$LLM_API_KEY
 ```
+
+Everything below is optional: more machines, a scheduler, a public URL.
 
 ## Setups
 
 <details>
-<summary><b>1. Single machine / workstation (no scheduler)</b></summary>
+<summary><b>1. One machine (the default) — what <code>llm local</code> sets up</b></summary>
 
-Everything runs on one box. Leave `LLM_GATEWAY_HOST` empty.
+`bin/llm local` is the whole setup: it builds llama.cpp if needed, starts the router, starts the
+gateway bound to `127.0.0.1`, generates a browser password if there isn't one, and prints the URLs.
+No config file, no heartbeat, no tunnel.
 
 ```bash
-bin/llm join              # router on :8080
-bin/llm passwd            # browser password for the chat UI
-bin/llm gateway up        # gateway on :4000 (chat, /status, /models, the API)
+bin/llm local             # everything
+bin/llm ls                # what is loaded, on which GPUs, how fast
+bin/llm up <model>        # load another model from the preset (fuzzy name)
+bin/llm stop && bin/llm gateway down
 ```
 
-Open `http://localhost:4000`. To add more machines later, run `bin/llm join` on each with
-`LLM_GATEWAY_HOST` (same network) or `LLM_PUBLIC_URL` (anywhere) set in `config.env`.
+The preset is chosen from the GPU count (`presets/single-24g.ini` for one GPU, and so on), so the
+models it offers match the machine. To add other machines later, see the next two sections.
 
 </details>
 

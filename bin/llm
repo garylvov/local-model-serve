@@ -374,8 +374,8 @@ cmd_gateway() {
         fi
         [[ "$HOST" == "$GW_HOST" ]] || say "note: starting a gateway on $HOST, but peers default to $GW_HOST (LLM_GATEWAY_HOST)"
         tmux new-session -d -s llm-gateway -c "$ROOT/gateway" "exec nice -n 5 '$ROOT/.venv/bin/python' -m uvicorn \
-          llm_gateway:app --host 0.0.0.0 --port $GW_PORT --no-access-log --timeout-keep-alive 75 >> '$RUN/gateway.log' 2>&1"
-        sleep 3; curl -sf "http://127.0.0.1:$GW_PORT/health" && echo && say "gateway up on 0.0.0.0:$GW_PORT" ;;
+          llm_gateway:app --host ${LLM_GATEWAY_BIND:-0.0.0.0} --port $GW_PORT --no-access-log --timeout-keep-alive 75 >> '$RUN/gateway.log' 2>&1"
+        sleep 3; curl -sf "http://127.0.0.1:$GW_PORT/health" && echo && say "gateway up on ${LLM_GATEWAY_BIND:-0.0.0.0}:$GW_PORT" ;;
     down) tmux kill-session -t =llm-gateway 2>/dev/null; say "gateway down" ;;
     status) printf 'header = "Authorization: Bearer %s"\n' "$(<"$KEYFILE")" | curl -sS -K - "http://127.0.0.1:$GW_PORT/peers" | jq . ;;
     *) die "usage: llm gateway up|down|status" ;;
@@ -601,6 +601,32 @@ cmd_tunnel() { # this machine's own cloudflared: a named tunnel if a token exist
   esac
 }
 
+cmd_local() {  # one command for a single machine: router + gateway on localhost, nothing public
+  # No peers, no heartbeat, no tunnel, no Cloudflare: the gateway binds 127.0.0.1 and this machine's
+  # router is its only peer. A browser password is still required (the chat UI can load models and
+  # drive the browser tool), so generate one and print it if none exists.
+  export LLM_GATEWAY_URL=none LLM_GATEWAY_BIND=127.0.0.1
+  [[ -s "$KEYFILE" ]] || cmd_auth init "http://127.0.0.1:$GW_PORT"
+  local pw=""
+  if [[ ! -s "$CONF/passwd" ]]; then
+    pw="$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')"
+    LLM_PASSWORD="$pw" cmd_passwd >/dev/null
+  fi
+  cmd_serve
+  tmux has-session -t =llm-gateway 2>/dev/null || cmd_gateway up
+  # register this router with the local gateway once (no heartbeat loop in local mode)
+  LLM_GATEWAY_URL="http://127.0.0.1:$GW_PORT" gw_post /peers/register >/dev/null 2>&1 || true
+  echo
+  say "local mode ready:"
+  echo "  chat + hardware + models : http://127.0.0.1:$GW_PORT"
+  echo "  OpenAI base URL          : http://127.0.0.1:$GW_PORT/v1"
+  echo "  Anthropic base URL       : http://127.0.0.1:$GW_PORT"
+  echo "  API key                  : $AUTH (LLM_API_KEY)"
+  [[ -n "$pw" ]] && echo "  browser password (new)   : $pw   # change it with: llm passwd"
+  say "models: $(sections | tr '\n' ' ')"
+  say "stop with: llm stop && llm gateway down"
+}
+
 cmd_join() { # ONE command to attach this machine: build if needed, serve, register, report
   if [[ "${1:-}" == --client ]]; then
     local base key
@@ -639,11 +665,11 @@ cmd_leave() { # clean the machine out of the gateway and stop serving
   say "left the gateway; nothing of this machine is registered"
 }
 
-usage() { sed -n '2,3p' "$0"; echo "usage: llm serve|stop|up|down|pause|resume|ls|pull|gateway|passwd|build|builds|tunnel|join|leave|auth ..."; }
+usage() { sed -n '2,3p' "$0"; echo "usage: llm local|serve|stop|up|down|pause|resume|ls|pull|gateway|passwd|build|builds|tunnel|join|leave|auth ..."; }
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  serve|stop|up|down|pause|resume|ls|pull|tunnel|join|auth|gateway|passwd|build|builds|leave) "cmd_$cmd" "$@" ;;
+  local|serve|stop|up|down|pause|resume|ls|pull|tunnel|join|auth|gateway|passwd|build|builds|leave) "cmd_$cmd" "$@" ;;
   _beat) resp="$(gw_post /peers/register)"; echo "$resp"; apply_commands "$resp"; cache_janitor ;;
   preset) preset ;;
   _presetjson) preset_json ;;
