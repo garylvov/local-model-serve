@@ -6,7 +6,7 @@ field (or ?model=) to a peer with that model loaded (sticky per session header, 
 in-flight); else to a peer that lists it (router autoload); else a JSON 404/503.
 Responses stream through byte for byte. Same shared API key for clients, peers and routers.
 """
-import asyncio, base64, hashlib, hmac, json, os, secrets, time, uuid
+import asyncio, base64, hashlib, hmac, json, os, re, secrets, time, uuid
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
@@ -387,6 +387,35 @@ async def machines(req: Request):
     return JSONResponse({"machines": out, "catalog_repos": sorted(catalog_repos())})
 
 
+async def usage_endpoint(req: Request):
+    """GET /usage?since=<epoch seconds>: aggregate run/<host>/gateway-usage.jsonl per lane. Reads
+    the whole file each call (usage-logging is diagnostic, not a metrics DB - fine at this scale;
+    revisit if the file grows past a few tens of MB)."""
+    if not authorized(req):
+        return err(401, "invalid API key")
+    try:
+        since = float(req.query_params.get("since", 0))
+    except ValueError:
+        return err(400, "since must be a unix timestamp")
+    lanes: dict = {}
+    f = RUN_DIR / "gateway-usage.jsonl"
+    if f.exists():
+        for line in f.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("ts", 0) < since:
+                continue
+            agg = lanes.setdefault(rec.get("lane", "?"), {"requests": 0, "wall_s": 0.0})
+            agg["requests"] += 1
+            agg["wall_s"] += rec.get("wall_s") or 0
+            for k, v in rec.items():
+                if k.endswith("_tokens") and isinstance(v, (int, float)):
+                    agg[k] = agg.get(k, 0) + v
+    return JSONResponse({"since": since, "lanes": lanes})
+
+
 async def peer_call(p: dict, url: str, method: str, path: str, params=None, json_body=None):
     u, h, ext = await target(url, path)
     r = await client.request(method, u, params=params, json=json_body, headers=peer_headers(p) | h,
@@ -610,6 +639,68 @@ def session_key(req: Request, body: dict):
     return uid or body.get("user")
 
 
+def translate_thinking(body: dict) -> bool:
+    """Anthropic `thinking: {type, budget_tokens}` on /v1/messages: llama.cpp's own
+    anthropic-to-oai converter (server-chat.cpp server_chat_convert_anthropic_to_oai) only
+    recognizes `type == "enabled"` (which it threads through as `thinking_budget_tokens`, read by
+    server-common.cpp alongside `reasoning_budget_tokens` — that direction already works). Any
+    other type - `"disabled"` (Anthropic's own value) or `"adaptive"` (what Claude Code actually
+    sends, `{"type":"adaptive","display":"omitted"}`, measured 2026-09-17) - falls through
+    unhandled, so the preset's own `chat-template-kwargs={"thinking":true}` default always wins
+    and the model keeps reasoning regardless of what the client asked for. Measured directly
+    against the router: `thinking:{"type":"disabled"}` alone still returns a `thinking` content
+    block; adding `chat_template_kwargs:{"thinking":false}` (which llama.cpp DOES pass through
+    verbatim) suppresses it. Translate only the disabled case; leave enabled/adaptive/absent alone
+    so the server's own default (and the native budget_tokens path) keep working unmodified."""
+    th = body.get("thinking")
+    if not isinstance(th, dict) or th.get("type") != "disabled":
+        return False
+    ctk = dict(body.get("chat_template_kwargs") or {})
+    ctk["thinking"] = False
+    body["chat_template_kwargs"] = ctk
+    return True
+
+
+USAGE_HEADERS = ("x-llm-lane", "x-session-id", "x-claude-code-session-id")
+RUN_DIR = Path(__file__).resolve().parent.parent / "run" / os.uname().nodename.split(".")[0]
+
+
+def usage_lane(req: Request, body: dict) -> str:
+    for h in USAGE_HEADERS:
+        if req.headers.get(h):
+            return req.headers[h]
+    return client_ip_generic(req)
+
+
+def log_usage(lane: str, ip: str, model: str, usage: dict, t_start: float, t_first_byte: float | None) -> None:
+    """One JSON line per request to run/<host>/gateway-usage.jsonl. Never prompt/response text —
+    only the lane key, model id, token counts and timings."""
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": time.time(), "lane": lane, "ip": ip, "model": model,
+               "wall_s": round(time.time() - t_start, 3),
+               "ttft_s": round(t_first_byte - t_start, 3) if t_first_byte else None, **usage}
+        with open(RUN_DIR / "gateway-usage.jsonl", "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        print(f"usage log write failed: {e}", flush=True)
+
+
+_USAGE_RE = re.compile(
+    rb'"(input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens|'
+    rb'prompt_tokens|completion_tokens|total_tokens)"\s*:\s*(\d+)')
+
+
+def parse_usage(buf: bytes) -> dict:
+    """Last value seen per key, scanning raw SSE or JSON response bytes (streaming sends usage
+    incrementally across several events; non-streaming has one usage object). Anthropic field
+    names win when both Anthropic and OAI-style keys appear."""
+    out: dict = {}
+    for k, v in _USAGE_RE.findall(buf):
+        out[k.decode()] = int(v)
+    return out
+
+
 inflight_by_replica: dict = {}   # (peer url, concrete model id) -> in-flight requests
 
 
@@ -718,6 +809,9 @@ async def proxy(req: Request):
             body = json.loads(raw)
         except ValueError:
             return err(400, "request body must be JSON", anthropic)
+    changed = False
+    if anthropic and isinstance(body, dict):
+        changed = translate_thinking(body) or changed
     model = body.get("model") if isinstance(body, dict) else None
     model = model or req.query_params.get("model")
     if not model:   # WebUI assets, /props, /health, ... : any healthy peer (this machine first)
@@ -731,12 +825,17 @@ async def proxy(req: Request):
         return err(503 if known else 404,
                    f"model '{model}' is " + ("not loaded; load it from the Models page" if known else
                                              "not served by any machine"), anthropic)
-    if mid != model and isinstance(body, dict):   # replica chosen: address the concrete instance
-        raw = json.dumps({**body, "model": mid}).encode()
-    return await forward(req, url, raw, autoload, anthropic, mid if mid != model else None)
+    if mid != model and isinstance(body, dict):
+        changed = True
+        body = {**body, "model": mid}
+    if changed:
+        raw = json.dumps(body).encode()
+    lane = usage_lane(req, body)
+    return await forward(req, url, raw, autoload, anthropic, mid if mid != model else None, lane, model)
 
 
-async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic: bool, replica: str | None = None):
+async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic: bool, replica: str | None = None,
+                   lane: str | None = None, model: str | None = None):
     p = peers[url]
     # Browser (WebUI) paths keep the client's Accept-Encoding so llama.cpp can serve its
     # pre-compressed assets; API paths stay uncompressed so SSE streams are never buffered.
@@ -756,6 +855,7 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
         p["inflight"] -= 1
         if rkey:
             inflight_by_replica[rkey] = max(0, inflight_by_replica.get(rkey, 1) - 1)
+    t_start = time.time()   # before dialing out: wall_s/ttft_s must cover connect + prefill, not just body transfer
     try:
         u, h, ext = await target(url, req.url.path)
         up = await client.send(client.build_request(req.method, u, params=q or None, headers=headers | h,
@@ -765,12 +865,35 @@ async def forward(req: Request, url: str, raw: bytes, autoload: bool, anthropic:
         p["ok"] = False
         return err(502, f"peer unreachable: {type(e).__name__}", anthropic)
 
+    # Usage logging (item 3): scan bytes as they pass through for the trailing usage numbers -
+    # never buffered/delayed for the client, only mirrored into a small side buffer capped well
+    # under one response's worth of usage JSON. Only for named-model API calls (chat/messages),
+    # not WebUI assets or /health polls.
+    log_this = lane is not None and model is not None and req.url.path.startswith(("/v1/", "/chat/"))
+
     async def relay():
+        # Anthropic streaming puts input/cache token counts in the FIRST event (message_start) and
+        # output_tokens in the LAST (message_delta), so both ends of the stream matter - keep a
+        # capped head+tail mirror rather than a true tail, never delaying what's yielded to the
+        # client and never growing unbounded on a huge completion.
+        t_first = None
+        head, tail = b"", b""
         try:
             async for chunk in up.aiter_raw():
+                if log_this:
+                    if t_first is None:
+                        t_first = time.time()
+                    if len(head) < 8000:
+                        head += chunk
+                    tail = (tail + chunk)[-8000:]
                 yield chunk
         finally:
             await up.aclose()
+            if log_this:
+                usage = parse_usage(head)
+                usage.update(parse_usage(tail))
+                if usage:
+                    log_usage(lane, client_ip_generic(req), model, usage, t_start, t_first)
             done()
 
     out = {k: v for k, v in up.headers.items() if k.lower() not in ("content-length", "transfer-encoding", "connection")}
@@ -1284,6 +1407,7 @@ routes = Starlette(lifespan=lifespan, routes=[
     Route("/v1/models", models), Route("/models", models),
     Route("/models-ui", models_page),
     Route("/machines", machines),
+    Route("/usage", usage_endpoint),
     Route("/machines/{host}/models/{model}/{action}", model_action, methods=["POST"]),
     Route("/machines/{host}/models/sse", model_sse),
     Route("/machines/{host}/models", model_download, methods=["POST"]),
